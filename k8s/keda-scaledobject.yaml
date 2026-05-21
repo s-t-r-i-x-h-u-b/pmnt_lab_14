@@ -1,0 +1,81 @@
+# KEDA ScaledObject — scales the collector on BOTH CPU and tumbling-window
+# buffer depth (queue-length proxy).
+#
+# KEDA manages its own HPA internally; do NOT apply k8s/hpa.yaml at the same time.
+#
+# Prerequisites:
+#   1. Install KEDA (one-time, cluster-wide):
+#        kubectl apply -f \
+#          https://github.com/kedacore/keda/releases/download/v2.15.0/keda-2.15.0.yaml
+#        kubectl -n keda wait --for=condition=ready pod \
+#          -l app=keda-operator --timeout=120s
+#
+#   2. Remove the plain HPA if it was applied:
+#        kubectl delete -f k8s/hpa.yaml --ignore-not-found
+#
+# Apply:
+#   kubectl apply -f k8s/keda-scaledobject.yaml
+# Observe:
+#   kubectl get scaledobject collector-scaledobject
+#   kubectl get hpa              # KEDA creates "keda-hpa-collector-scaledobject"
+#   kubectl describe scaledobject collector-scaledobject
+---
+apiVersion: keda.sh/v1alpha1
+kind: ScaledObject
+metadata:
+  name: collector-scaledobject
+spec:
+  scaleTargetRef:
+    apiVersion: apps/v1
+    kind: Deployment
+    name: collector
+  minReplicaCount: 1
+  maxReplicaCount: 5
+  # Seconds to wait after the last trigger fired before scaling down.
+  cooldownPeriod:  120
+  # How often (seconds) KEDA polls the external triggers.
+  pollingInterval: 15
+
+  advanced:
+    horizontalPodAutoscalerConfig:
+      behavior:
+        scaleUp:
+          stabilizationWindowSeconds: 60
+          policies:
+            - type: Pods
+              value: 1
+              periodSeconds: 60
+        scaleDown:
+          stabilizationWindowSeconds: 300
+          policies:
+            - type: Pods
+              value: 1
+              periodSeconds: 120
+
+  triggers:
+    # ── Trigger 1: CPU utilisation ────────────────────────────────────────────
+    # Standard Kubernetes resource metric; requires metrics-server.
+    # KEDA passes this through to the managed HPA unchanged.
+    - type: cpu
+      metricType: Utilization
+      metadata:
+        value: "60"   # scale up when average CPU > 60% of request
+
+    # ── Trigger 2: Tumbling-window buffer depth (queue-length proxy) ──────────
+    # Polls the collector's /window HTTP endpoint (ClusterIP service, port 8080).
+    # The response JSON contains "buffer_size": <int> — the number of raw
+    # measurements currently waiting in the in-memory tumbling window.
+    #
+    # Interpretation: if the buffer grows beyond targetValue on average, new
+    # measurements are arriving faster than the window can flush them — a signal
+    # to add more collector replicas so the coordinator can spread the load.
+    #
+    # Note: the ClusterIP service load-balances to a random pod on each poll;
+    # the sampled value is a per-pod reading, not a cluster aggregate.
+    # This is a good approximation because etcd distributes shards evenly.
+    - type: metrics-api
+      metadata:
+        targetValue:   "200"            # scale up when buffer_size > 200
+        url:           "http://collector:8080/window"
+        valueLocation: "buffer_size"   # top-level JSON key (gjson syntax)
+        method:        "get"

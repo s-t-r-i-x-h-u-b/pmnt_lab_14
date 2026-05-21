@@ -441,3 +441,107 @@ pip install validator/target/wheels/*.whl
 make run-local           # docker compose up --build (multi-stage)
 make k8s-build-images    # docker build с project-root context
 ```
+
+---
+
+## 2026-05-21 — Задание «Развёртывание в Kubernetes с автоскалированием»
+
+### Промпт
+> Развёртывание в Kubernetes с автоскалированием.
+> Упаковать Go-сборщик в Docker-образ. Развернуть конвейер в minikube/k3s.
+> Настроить HPA (Horizontal Pod Autoscaler) для сборщика на основе длины очереди
+> или загрузки CPU.
+
+### Результат
+
+#### Новые файлы
+| Файл | Назначение |
+|------|-----------|
+| `k8s/hpa.yaml`               | HPA `autoscaling/v2`: CPU + memory, min=1, max=5 |
+| `k8s/keda-scaledobject.yaml` | KEDA ScaledObject: CPU + buffer\_size (queue-depth) |
+| `k8s/prometheus.yaml`        | Prometheus: RBAC + ConfigMap + Deployment (pod-discovery) |
+
+#### Изменённые файлы
+| Файл | Что изменилось |
+|------|---------------|
+| `collector/cmd/collector/main.go` | Эндпоинт `/metrics/prometheus` (Prometheus text format) |
+| `k8s/collector.yaml`              | Readiness probe, pod-аннотации, headless Service |
+| `Makefile`                        | `k8s-hpa-setup`, `k8s-keda-setup`, `k8s-hpa-status`, `k8s-load-test` |
+
+#### Два варианта HPA
+
+**Вариант 1 — стандартный HPA (только CPU/memory)**
+
+```
+make k8s-hpa-setup   # minikube addons enable metrics-server + kubectl apply hpa.yaml
+```
+
+```yaml
+apiVersion: autoscaling/v2
+kind: HorizontalPodAutoscaler
+metrics:
+- type: Resource
+  resource: { name: cpu, target: { averageUtilization: 60 } }
+- type: Resource
+  resource: { name: memory, target: { averageUtilization: 75 } }
+behavior:
+  scaleUp:   { stabilizationWindowSeconds: 60,  policies: [{type: Pods, value: 1, periodSeconds: 60}] }
+  scaleDown: { stabilizationWindowSeconds: 300, policies: [{type: Pods, value: 1, periodSeconds: 120}] }
+```
+
+**Вариант 2 — KEDA ScaledObject (CPU + длина очереди)**
+
+```
+make k8s-keda-setup  # install KEDA + apply keda-scaledobject.yaml (удаляет plain HPA)
+```
+
+```yaml
+triggers:
+- type: cpu
+  metadata: { value: "60" }
+- type: metrics-api
+  metadata:
+    url:           "http://collector:8080/window"
+    valueLocation: "buffer_size"   # JSON-поле из GET /window
+    targetValue:   "200"
+```
+
+KEDA опрашивает `/window` каждые 15 с. При `buffer_size > 200` добавляет поды.
+
+#### Prometheus-метрики (`GET /metrics/prometheus`)
+
+```
+collector_window_buffer_size{collector_id="collector-abc"} 142
+collector_flight_raw_batches{collector_id="..."}  18
+collector_flight_agg_batches{collector_id="..."}   7
+collector_fetches_total{collector_id="..."}       312
+collector_bytes_published_total{collector_id="..."} 16384000
+collector_window_flushes_total{collector_id="..."}  24
+```
+
+Prometheus scrape через pod-аннотации:
+```yaml
+prometheus.io/scrape: "true"
+prometheus.io/port:   "8080"
+prometheus.io/path:   "/metrics/prometheus"
+```
+
+#### Нагрузочный тест
+
+```bash
+make k8s-build-images && make k8s-deploy && make k8s-keda-setup
+make k8s-load-test       # FETCH_INTERVAL=10s, WINDOW_MAX_SIZE=50
+make k8s-hpa-status      # kubectl top pods + get hpa/scaledobject
+# Prometheus: http://$(minikube ip):30090
+```
+
+#### Показатели производительности
+
+| Метрика              | Источник                   | Порог масштабирования |
+|----------------------|----------------------------|-----------------------|
+| CPU utilisation      | metrics-server (cAdvisor)  | > 60%                 |
+| Memory utilisation   | metrics-server             | > 75%                 |
+| `buffer_size`        | GET /window каждые 15 с    | > 200 записей         |
+
+- scaleUp stabilization: 60 с (фильтр кратковременных пиков)
+- scaleDown stabilization: 300 с (предотвращает thrashing после сброса окна)

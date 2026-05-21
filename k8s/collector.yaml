@@ -13,7 +13,7 @@ metadata:
   labels:
     app: collector
 spec:
-  replicas: 3
+  replicas: 2
   selector:
     matchLabels:
       app: collector
@@ -21,6 +21,11 @@ spec:
     metadata:
       labels:
         app: collector
+      annotations:
+        # Prometheus pod-discovery annotations — scraped by prometheus.yaml ConfigMap.
+        prometheus.io/scrape: "true"
+        prometheus.io/port:   "8080"
+        prometheus.io/path:   "/metrics/prometheus"
     spec:
       containers:
         - name: collector
@@ -62,18 +67,27 @@ spec:
               name: flight
           resources:
             requests:
-              cpu: 100m
+              cpu:    100m
               memory: 128Mi
             limits:
-              cpu: 500m
+              cpu:    500m
               memory: 512Mi
+          readinessProbe:
+            httpGet:
+              path: /metrics
+              port: 8080
+            initialDelaySeconds: 5
+            periodSeconds: 10
+            failureThreshold: 3
           livenessProbe:
             httpGet:
               path: /shards
               port: 8080
-            initialDelaySeconds: 15
+            initialDelaySeconds: 20
             periodSeconds: 30
+            failureThreshold: 5
 ---
+# ClusterIP service — internal access for NATS, Flight, and KEDA metrics-api polling.
 apiVersion: v1
 kind: Service
 metadata:
@@ -88,3 +102,19 @@ spec:
     - name: flight
       port: 5005
       targetPort: 5005
+---
+# Headless service — lets Prometheus discover and scrape each pod individually.
+apiVersion: v1
+kind: Service
+metadata:
+  name: collector-headless
+  labels:
+    app: collector
+spec:
+  clusterIP: None
+  selector:
+    app: collector
+  ports:
+    - name: metrics
+      port: 8080
+      targetPort: 8080

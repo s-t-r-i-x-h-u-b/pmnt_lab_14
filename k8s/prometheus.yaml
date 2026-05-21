@@ -1,0 +1,138 @@
+# Minimal Prometheus deployment for scraping collector pods.
+#
+# Discovers pods via the annotations set in collector.yaml:
+#   prometheus.io/scrape: "true"
+#   prometheus.io/port:   "8080"
+#   prometheus.io/path:   "/metrics/prometheus"
+#
+# Prometheus UI: kubectl port-forward svc/prometheus 9090:9090
+#                http://localhost:9090
+#
+# Useful queries:
+#   collector_window_buffer_size          — buffer depth per pod
+#   rate(collector_fetches_total[5m])     — fetch rate
+#   rate(collector_bytes_published_total[5m]) / 1e6  — MB/s published
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: prometheus
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: prometheus
+rules:
+  - apiGroups: [""]
+    resources: [nodes, nodes/proxy, services, endpoints, pods]
+    verbs:     [get, list, watch]
+  - nonResourceURLs: ["/metrics", "/metrics/prometheus"]
+    verbs: [get]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: prometheus
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind:     ClusterRole
+  name:     prometheus
+subjects:
+  - kind:      ServiceAccount
+    name:      prometheus
+    namespace: default
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: prometheus-config
+data:
+  prometheus.yml: |
+    global:
+      scrape_interval:     15s
+      evaluation_interval: 15s
+
+    scrape_configs:
+      # Discover pods annotated with prometheus.io/scrape=true.
+      - job_name: collector-pods
+        kubernetes_sd_configs:
+          - role: pod
+        relabel_configs:
+          # Keep only annotated pods.
+          - source_labels: [__meta_kubernetes_pod_annotation_prometheus_io_scrape]
+            action: keep
+            regex: "true"
+          # Build <pod_ip>:<port> from annotations.
+          - source_labels: [__meta_kubernetes_pod_ip,
+                            __meta_kubernetes_pod_annotation_prometheus_io_port]
+            action:      replace
+            regex:       '(.+);(.+)'
+            replacement: '$1:$2'
+            target_label: __address__
+          # Override the default /metrics path if annotation is set.
+          - source_labels: [__meta_kubernetes_pod_annotation_prometheus_io_path]
+            action:      replace
+            regex:       '(.+)'
+            target_label: __metrics_path__
+          # Carry useful metadata as labels.
+          - source_labels: [__meta_kubernetes_pod_label_app]
+            target_label: app
+          - source_labels: [__meta_kubernetes_pod_name]
+            target_label: pod
+          - source_labels: [__meta_kubernetes_namespace]
+            target_label: namespace
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: prometheus
+  labels:
+    app: prometheus
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: prometheus
+  template:
+    metadata:
+      labels:
+        app: prometheus
+    spec:
+      serviceAccountName: prometheus
+      containers:
+        - name: prometheus
+          image: prom/prometheus:v2.54.0
+          args:
+            - --config.file=/etc/prometheus/prometheus.yml
+            - --storage.tsdb.retention.time=2h    # short retention — lab only
+            - --web.enable-lifecycle
+          ports:
+            - containerPort: 9090
+              name: http
+          volumeMounts:
+            - name: config
+              mountPath: /etc/prometheus
+          resources:
+            requests:
+              cpu:    100m
+              memory: 256Mi
+            limits:
+              cpu:    500m
+              memory: 512Mi
+      volumes:
+        - name: config
+          configMap:
+            name: prometheus-config
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: prometheus
+spec:
+  type:     NodePort
+  selector:
+    app: prometheus
+  ports:
+    - port:       9090
+      targetPort: 9090
+      nodePort:   30090   # http://$(minikube ip):30090

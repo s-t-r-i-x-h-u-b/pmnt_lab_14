@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"net/http"
 	"os"
 	"os/signal"
@@ -158,12 +159,47 @@ func main() {
 		w.Header().Set("Content-Type", "application/json")
 		rawLen, aggLen := flightSrv.Sizes()
 		json.NewEncoder(w).Encode(map[string]any{
-			"buffer_size":       win.BufferSize(),
-			"window_duration":   windowDuration.String(),
-			"window_max_size":   windowMaxSize,
+			"buffer_size":        win.BufferSize(),
+			"window_duration":    windowDuration.String(),
+			"window_max_size":    windowMaxSize,
 			"flight_raw_batches": rawLen,
 			"flight_agg_batches": aggLen,
 		})
+	})
+	// Prometheus text-format metrics — used by Prometheus scraper and HPA custom metrics.
+	http.HandleFunc("/metrics/prometheus", func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "text/plain; version=0.0.4; charset=utf-8")
+		bufSize := win.BufferSize()
+		rawLen, aggLen := flightSrv.Sizes()
+		summary := app.metrics.Summary()
+		var fetchTotal, bytesTotal int64
+		for _, f := range summary.Fetches {
+			fetchTotal++
+			bytesTotal += f.BytesPublished
+		}
+		var flushTotal int64
+		for range summary.Flushes {
+			flushTotal++
+		}
+		id := instanceID
+		fmt.Fprintf(w, "# HELP collector_window_buffer_size Measurements buffered in the tumbling window.\n")
+		fmt.Fprintf(w, "# TYPE collector_window_buffer_size gauge\n")
+		fmt.Fprintf(w, "collector_window_buffer_size{collector_id=%q} %d\n", id, bufSize)
+		fmt.Fprintf(w, "# HELP collector_flight_raw_batches Arrow record batches in the raw Flight ring-buffer.\n")
+		fmt.Fprintf(w, "# TYPE collector_flight_raw_batches gauge\n")
+		fmt.Fprintf(w, "collector_flight_raw_batches{collector_id=%q} %d\n", id, rawLen)
+		fmt.Fprintf(w, "# HELP collector_flight_agg_batches Arrow record batches in the agg Flight ring-buffer.\n")
+		fmt.Fprintf(w, "# TYPE collector_flight_agg_batches gauge\n")
+		fmt.Fprintf(w, "collector_flight_agg_batches{collector_id=%q} %d\n", id, aggLen)
+		fmt.Fprintf(w, "# HELP collector_fetches_total Total OpenAQ fetch cycles completed.\n")
+		fmt.Fprintf(w, "# TYPE collector_fetches_total counter\n")
+		fmt.Fprintf(w, "collector_fetches_total{collector_id=%q} %d\n", id, fetchTotal)
+		fmt.Fprintf(w, "# HELP collector_bytes_published_total Total bytes published to NATS.\n")
+		fmt.Fprintf(w, "# TYPE collector_bytes_published_total counter\n")
+		fmt.Fprintf(w, "collector_bytes_published_total{collector_id=%q} %d\n", id, bytesTotal)
+		fmt.Fprintf(w, "# HELP collector_window_flushes_total Tumbling window flush events.\n")
+		fmt.Fprintf(w, "# TYPE collector_window_flushes_total counter\n")
+		fmt.Fprintf(w, "collector_window_flushes_total{collector_id=%q} %d\n", id, flushTotal)
 	})
 	srv := &http.Server{Addr: metricsAddr}
 	go func() { _ = srv.ListenAndServe() }()

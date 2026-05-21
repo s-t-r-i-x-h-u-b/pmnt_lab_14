@@ -1,0 +1,60 @@
+# Horizontal Pod Autoscaler for the collector Deployment.
+#
+# Requires metrics-server to be running:
+#   minikube:  minikube addons enable metrics-server
+#   k3s:       metrics-server is bundled by default
+#
+# This HPA scales on CPU utilisation only.
+# For queue-depth (buffer_size) scaling use keda-scaledobject.yaml instead —
+# do NOT apply both at the same time; KEDA manages its own HPA object.
+#
+# Apply:
+#   kubectl apply -f k8s/hpa.yaml
+# Observe:
+#   kubectl get hpa collector-hpa -w
+#   kubectl describe hpa collector-hpa
+---
+apiVersion: autoscaling/v2
+kind: HorizontalPodAutoscaler
+metadata:
+  name: collector-hpa
+spec:
+  scaleTargetRef:
+    apiVersion: apps/v1
+    kind: Deployment
+    name: collector
+  minReplicas: 1
+  maxReplicas: 5
+  metrics:
+    # Primary metric: average CPU utilisation across all collector pods.
+    # Scale up when any pod's CPU exceeds 60% of its request (100m).
+    - type: Resource
+      resource:
+        name: cpu
+        target:
+          type:               Utilization
+          averageUtilization: 60
+    # Secondary metric: average memory utilisation.
+    # Useful guard against memory leaks during sustained high ingest.
+    - type: Resource
+      resource:
+        name: memory
+        target:
+          type:               Utilization
+          averageUtilization: 75
+  behavior:
+    scaleUp:
+      # Wait 60 s of sustained pressure before adding a replica.
+      stabilizationWindowSeconds: 60
+      policies:
+        - type:          Pods
+          value:         1          # add at most 1 pod per period
+          periodSeconds: 60
+    scaleDown:
+      # Wait 5 min of sustained low load before removing a replica.
+      # Prevents thrashing when fetch cycles cause short CPU spikes.
+      stabilizationWindowSeconds: 300
+      policies:
+        - type:          Pods
+          value:         1          # remove at most 1 pod per period
+          periodSeconds: 120
