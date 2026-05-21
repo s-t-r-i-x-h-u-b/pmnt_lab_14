@@ -41,6 +41,10 @@ spec:
               value: "true"
             - name: METRICS_ADDR
               value: ":8080"
+            - name: FLIGHT_ADDR
+              value: ":5005"
+            - name: FLIGHT_STORE_LEN
+              value: "200"
             - name: INSTANCE_ID
               valueFrom:
                 fieldRef:
@@ -54,6 +58,8 @@ spec:
           ports:
             - containerPort: 8080
               name: metrics
+            - containerPort: 5005
+              name: flight
           resources:
             requests:
               cpu: 100m
@@ -79,3 +85,6 @@ spec:
     - name: metrics
       port: 8080
       targetPort: 8080
+    - name: flight
+      port: 5005
+      targetPort: 5005

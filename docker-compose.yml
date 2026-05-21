@@ -44,10 +44,16 @@ services:
       NATS_URL: nats://nats:4222
       OPENAQ_API_KEY: ${OPENAQ_API_KEY:-}
       FETCH_INTERVAL: ${FETCH_INTERVAL:-5m}
+      WINDOW_DURATION: ${WINDOW_DURATION:-60s}
+      WINDOW_MAX_SIZE: ${WINDOW_MAX_SIZE:-500}
+      PUBLISH_RAW: "true"
       INSTANCE_ID: collector-1
       METRICS_ADDR: ":8080"
+      FLIGHT_ADDR: ":5005"
+      FLIGHT_STORE_LEN: "200"
     ports:
-      - "8081:8080"
+      - "8081:8080"   # metrics/shards HTTP
+      - "5005:5005"   # Arrow Flight gRPC (primary)
     depends_on:
       etcd:
         condition: service_healthy
@@ -63,10 +69,16 @@ services:
       NATS_URL: nats://nats:4222
       OPENAQ_API_KEY: ${OPENAQ_API_KEY:-}
       FETCH_INTERVAL: ${FETCH_INTERVAL:-5m}
+      WINDOW_DURATION: ${WINDOW_DURATION:-60s}
+      WINDOW_MAX_SIZE: ${WINDOW_MAX_SIZE:-500}
+      PUBLISH_RAW: "true"
       INSTANCE_ID: collector-2
       METRICS_ADDR: ":8080"
+      FLIGHT_ADDR: ":5005"
+      FLIGHT_STORE_LEN: "200"
     ports:
       - "8082:8080"
+      - "5006:5005"   # Arrow Flight gRPC
     depends_on:
       etcd:
         condition: service_healthy
@@ -82,10 +94,16 @@ services:
       NATS_URL: nats://nats:4222
       OPENAQ_API_KEY: ${OPENAQ_API_KEY:-}
       FETCH_INTERVAL: ${FETCH_INTERVAL:-5m}
+      WINDOW_DURATION: ${WINDOW_DURATION:-60s}
+      WINDOW_MAX_SIZE: ${WINDOW_MAX_SIZE:-500}
+      PUBLISH_RAW: "true"
       INSTANCE_ID: collector-3
       METRICS_ADDR: ":8080"
+      FLIGHT_ADDR: ":5005"
+      FLIGHT_STORE_LEN: "200"
     ports:
       - "8083:8080"
+      - "5007:5005"   # Arrow Flight gRPC
     depends_on:
       etcd:
         condition: service_healthy
@@ -99,11 +117,14 @@ services:
     command: uvicorn api.main:app --host 0.0.0.0 --port 8000 --reload
     environment:
       NATS_URL: nats://nats:4222
+      FLIGHT_ENDPOINT: grpc://collector-1:5005  # connect to collector-1 Flight server
     ports:
       - "8000:8000"
     depends_on:
       nats:
         condition: service_healthy
+      collector-1:
+        condition: service_started
 
   dashboard:
     build:

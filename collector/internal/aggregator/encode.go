@@ -27,24 +27,25 @@ var AggSchema = arrow.NewSchema([]arrow.Field{
 	{Name: "collector_id",   Type: arrow.BinaryTypes.String},
 }, nil)
 
-// EncodeToArrow serialises a batch of AggRecords as an Arrow IPC stream.
-func EncodeToArrow(records []AggRecord) ([]byte, error) {
+// BuildRecord creates an Arrow Record for AggRecords.
+// The caller owns the record and must call rec.Release() when done.
+func BuildRecord(records []AggRecord) (arrow.Record, error) {
 	mem := memory.NewGoAllocator()
 	b := array.NewRecordBuilder(mem, AggSchema)
 	defer b.Release()
 
-	winStarts  := b.Field(0).(*array.TimestampBuilder)
-	winEnds    := b.Field(1).(*array.TimestampBuilder)
-	countries  := b.Field(2).(*array.StringBuilder)
-	params     := b.Field(3).(*array.StringBuilder)
-	units      := b.Field(4).(*array.StringBuilder)
-	counts     := b.Field(5).(*array.Int64Builder)
-	means      := b.Field(6).(*array.Float64Builder)
-	mins       := b.Field(7).(*array.Float64Builder)
-	maxs       := b.Field(8).(*array.Float64Builder)
-	stds       := b.Field(9).(*array.Float64Builder)
-	locCounts  := b.Field(10).(*array.Int64Builder)
-	collIDs    := b.Field(11).(*array.StringBuilder)
+	winStarts := b.Field(0).(*array.TimestampBuilder)
+	winEnds   := b.Field(1).(*array.TimestampBuilder)
+	countries := b.Field(2).(*array.StringBuilder)
+	params    := b.Field(3).(*array.StringBuilder)
+	units     := b.Field(4).(*array.StringBuilder)
+	counts    := b.Field(5).(*array.Int64Builder)
+	means     := b.Field(6).(*array.Float64Builder)
+	mins      := b.Field(7).(*array.Float64Builder)
+	maxs      := b.Field(8).(*array.Float64Builder)
+	stds      := b.Field(9).(*array.Float64Builder)
+	locCounts := b.Field(10).(*array.Int64Builder)
+	collIDs   := b.Field(11).(*array.StringBuilder)
 
 	for _, r := range records {
 		winStarts.Append(arrow.Timestamp(r.WindowStart.UnixMicro()))
@@ -60,8 +61,15 @@ func EncodeToArrow(records []AggRecord) ([]byte, error) {
 		locCounts.Append(r.LocationCount)
 		collIDs.Append(r.CollectorID)
 	}
+	return b.NewRecord(), nil
+}
 
-	rec := b.NewRecord()
+// EncodeToArrow serialises AggRecords to Arrow IPC stream bytes (for NATS).
+func EncodeToArrow(records []AggRecord) ([]byte, error) {
+	rec, err := BuildRecord(records)
+	if err != nil {
+		return nil, err
+	}
 	defer rec.Release()
 
 	var buf bytes.Buffer

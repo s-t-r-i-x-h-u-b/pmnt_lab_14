@@ -19,8 +19,10 @@ import (
 	"pmnt_lab14/collector/internal/aggregator"
 	"pmnt_lab14/collector/internal/coordinator"
 	"pmnt_lab14/collector/internal/fetcher"
+	"pmnt_lab14/collector/internal/flightserver"
 	"pmnt_lab14/collector/internal/metrics"
 	"pmnt_lab14/collector/internal/publisher"
+	"pmnt_lab14/collector/internal/schema"
 )
 
 var allShards = []string{
@@ -57,11 +59,13 @@ func main() {
 	etcdEndpoints  := strings.Split(getenv("ETCD_ENDPOINTS", "http://localhost:2379"), ",")
 	natsURL        := getenv("NATS_URL", nats.DefaultURL)
 	openAQKey      := getenv("OPENAQ_API_KEY", "")
-	fetchInterval  := parseDuration(getenv("FETCH_INTERVAL", "5m"), 5*time.Minute)
+	fetchInterval  := parseDuration(getenv("FETCH_INTERVAL",  "5m"),  5*time.Minute)
 	metricsAddr    := getenv("METRICS_ADDR", ":8080")
 	windowDuration := parseDuration(getenv("WINDOW_DURATION", "60s"), 60*time.Second)
 	windowMaxSize  := parseInt(getenv("WINDOW_MAX_SIZE", "500"), 500)
 	publishRaw     := getenv("PUBLISH_RAW", "true") == "true"
+	flightAddr     := getenv("FLIGHT_ADDR", ":5005")
+	flightStoreLen := parseInt(getenv("FLIGHT_STORE_LEN", "200"), 200)
 
 	logger.Info("Starting collector",
 		zap.String("id", instanceID),
@@ -71,6 +75,7 @@ func main() {
 		zap.Duration("window_duration", windowDuration),
 		zap.Int("window_max_size", windowMaxSize),
 		zap.Bool("publish_raw", publishRaw),
+		zap.String("flight_addr", flightAddr),
 	)
 
 	etcdCli, err := clientv3.New(clientv3.Config{
@@ -87,6 +92,13 @@ func main() {
 		logger.Fatal("Connect to NATS", zap.Error(err))
 	}
 	defer nc.Drain()
+
+	// Arrow Flight server.
+	flightSrv := flightserver.New(flightStoreLen, logger)
+	if err := flightSrv.Start(flightAddr); err != nil {
+		logger.Fatal("Start Flight server", zap.Error(err))
+	}
+	defer flightSrv.Stop()
 
 	host, _ := os.Hostname()
 	coord := coordinator.New(etcdCli, instanceID, coordinator.Info{
@@ -108,6 +120,7 @@ func main() {
 		metrics:    metrics.New(),
 		interval:   fetchInterval,
 		window:     win,
+		flightSrv:  flightSrv,
 		publishRaw: publishRaw,
 		logger:     logger,
 	}
@@ -120,7 +133,6 @@ func main() {
 		logger.Fatal("Start coordinator", zap.Error(err))
 	}
 
-	// Flush goroutine: reads closed windows and publishes aggregated batches.
 	go func() {
 		for {
 			select {
@@ -143,10 +155,13 @@ func main() {
 	})
 	http.HandleFunc("/window", func(w http.ResponseWriter, _ *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
+		rawLen, aggLen := flightSrv.Sizes()
 		json.NewEncoder(w).Encode(map[string]any{
-			"buffer_size":     win.BufferSize(),
-			"window_duration": windowDuration.String(),
-			"window_max_size": windowMaxSize,
+			"buffer_size":       win.BufferSize(),
+			"window_duration":   windowDuration.String(),
+			"window_max_size":   windowMaxSize,
+			"flight_raw_batches": rawLen,
+			"flight_agg_batches": aggLen,
 		})
 	})
 	srv := &http.Server{Addr: metricsAddr}
@@ -170,14 +185,13 @@ type App struct {
 	metrics    *metrics.Collector
 	interval   time.Duration
 	window     *aggregator.Window
+	flightSrv  *flightserver.FlightServer
 	publishRaw bool
 	logger     *zap.Logger
 }
 
-// OnShardAssigned fetches data for the given country on every interval tick.
 func (a *App) OnShardAssigned(ctx context.Context, shard string) {
 	a.fetchAndPublish(ctx, shard)
-
 	ticker := time.NewTicker(a.interval)
 	defer ticker.Stop()
 	for {
@@ -190,8 +204,8 @@ func (a *App) OnShardAssigned(ctx context.Context, shard string) {
 	}
 }
 
-// fetchAndPublish fetches raw measurements, optionally publishes them, then feeds
-// them into the tumbling window for aggregation.
+// fetchAndPublish fetches raw measurements, publishes to NATS (if enabled),
+// feeds the Flight store, and enqueues into the tumbling window.
 func (a *App) fetchAndPublish(ctx context.Context, country string) {
 	start := time.Now()
 
@@ -203,10 +217,20 @@ func (a *App) fetchAndPublish(ctx context.Context, country string) {
 	if len(measurements) == 0 {
 		return
 	}
-
 	fetchDuration := time.Since(start)
 
-	// Optionally publish raw data.
+	// Build one Arrow Record shared by Flight and (optionally) NATS encode.
+	rawRec, err := schema.BuildRecord(measurements)
+	if err != nil {
+		a.logger.Error("BuildRecord error", zap.String("country", country), zap.Error(err))
+		return
+	}
+	defer rawRec.Release()
+
+	// Feed the Flight server directly from the in-memory Record.
+	a.flightSrv.AddRaw(rawRec)
+
+	// Optionally publish raw data to NATS (Arrow IPC re-encoded from the Record).
 	var bytesRaw int64
 	if a.publishRaw {
 		bytesRaw, err = a.publisher.Publish(ctx, country, measurements)
@@ -229,18 +253,24 @@ func (a *App) fetchAndPublish(ctx context.Context, country string) {
 		)
 	}
 
-	// Always feed into the tumbling window.
 	a.window.Add(measurements...)
 }
 
-// publishAggregated groups AggRecords by country and publishes each group.
+// publishAggregated groups AggRecords by country, publishes via NATS, and feeds
+// the aggregated Flight store.
 func (a *App) publishAggregated(ctx context.Context, records []aggregator.AggRecord) {
+	// Build one Arrow Record for the Flight store.
+	aggRec, err := aggregator.BuildRecord(records)
+	if err == nil {
+		a.flightSrv.AddAgg(aggRec)
+		aggRec.Release()
+	}
+
 	byCountry := make(map[string][]aggregator.AggRecord, 8)
 	for _, r := range records {
 		byCountry[r.CountryCode] = append(byCountry[r.CountryCode], r)
 	}
 
-	// Sum raw readings represented in this window for the compression metric.
 	var rawCount int
 	for _, r := range records {
 		rawCount += int(r.Count)

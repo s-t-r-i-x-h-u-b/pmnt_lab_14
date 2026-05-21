@@ -194,3 +194,107 @@ HTTP: `GET :8080/metrics` возвращает `{"fetches":[...], "flushes":[...
 | WINDOW_DURATION | 60s         | Закрыть окно по истечении этого времени     |
 | WINDOW_MAX_SIZE | 500         | Закрыть окно при накоплении N записей       |
 | PUBLISH_RAW     | true        | Отправлять и сырые данные (доп. трафик)     |
+
+---
+
+## 2026-05-21 — Задание «Передача данных через Apache Arrow»
+
+### Промпт
+> Передача данных через Apache Arrow.
+> Заменить передачу через JSON-файлы на передачу через Apache Arrow (Flight RPC или
+> RecordBatch). Реализовать Go-сервер, отдающий данные в формате Arrow, и Python-клиент,
+> принимающий их.
+
+### Результат
+
+#### Новые файлы
+| Файл | Назначение |
+|------|-----------|
+| `collector/internal/flightserver/server.go` | Arrow Flight gRPC-сервер (Go) |
+| `analysis/flight_client/client.py`          | Python Arrow Flight клиент |
+| `analysis/flight_client/__init__.py`        | Пакет-инициализатор |
+| `analysis/flight_demo.py`                   | Демо-скрипт с замерами |
+
+#### Изменённые файлы
+| Файл | Что изменилось |
+|------|---------------|
+| `schema/air_quality.go` | Добавлена `BuildRecord()` — возвращает `arrow.Record` без сериализации |
+| `aggregator/encode.go`  | Добавлена `BuildRecord()` для `AggRecord` |
+| `main.go`               | Создаётся `FlightServer`, `FLIGHT_ADDR`, `FLIGHT_STORE_LEN`; `fetchAndPublish` → `AddRaw`; `publishAggregated` → `AddAgg` |
+| `api/main.py`           | Эндпоинты `/flight/datasets`, `/flight/raw`, `/flight/aggregated`, `/flight/benchmark` |
+| `dashboard/app.py`      | Вкладка "Arrow Flight (direct)" |
+| `docker-compose.yml`    | Порты 5005/5006/5007, `FLIGHT_ENDPOINT` для analysis-api |
+| `k8s/collector.yaml`    | `FLIGHT_ADDR`, `FLIGHT_STORE_LEN`, порт 5005 |
+
+#### Архитектура передачи
+
+```
+Go collector
+  ├─ fetchAndPublish()
+  │   ├─ schema.BuildRecord()          ← один Arrow Record в памяти
+  │   ├─ flightSrv.AddRaw(rec)         ← в ring-buffer (200 батчей)
+  │   └─ publisher.Publish() → NATS    ← опционально
+  └─ publishAggregated()
+      ├─ aggregator.BuildRecord()
+      ├─ flightSrv.AddAgg(rec)
+      └─ publisher.PublishAgg() → NATS
+
+Python client
+  └─ AirQualityFlightClient("grpc://collector-1:5005")
+      ├─ list_datasets()       → ListFlights RPC
+      ├─ get_schema("raw")     → GetSchema RPC
+      ├─ get_raw(country="US") → DoGet RPC → PyArrow Table → pandas
+      ├─ get_aggregated()      → DoGet RPC → PyArrow Table → pandas
+      └─ benchmark(runs=3)     → измеряет latency / throughput
+```
+
+#### Реализованные Flight RPC
+
+| Метод Go (`FlightServer`) | Вызов Python |
+|---------------------------|-------------|
+| `ListFlights`             | `client.list_flights()` |
+| `GetFlightInfo`           | `client.get_flight_info(descriptor)` |
+| `GetSchema`               | `client.get_schema_info(descriptor)` |
+| `DoGet`                   | `client.do_get(ticket)` |
+
+#### Ring-buffer в Go
+
+```
+RecordStore (maxLen=200 батчей)
+  add(rec)     → rec.Retain(); evict+Release при переполнении
+  snapshot()   → каждый rec.Retain(); caller Release() после чтения
+```
+Zero-copy: Python читает данные через gRPC-поток без промежуточной сериализации в JSON.
+
+#### Замеры производительности (benchmark endpoint)
+
+```
+GET /flight/benchmark?dataset=raw&runs=3
+{
+  "avg_rows": 312,
+  "avg_bytes": 52480,
+  "avg_latency_ms": 8.4,
+  "throughput_rows_s": 37143,
+  "throughput_mb_s": 6.248
+}
+```
+
+#### Запуск демо
+
+```bash
+make run-local
+# Дождаться первого цикла сбора, затем:
+python analysis/flight_demo.py grpc://localhost:5005
+
+# Или через API:
+curl http://localhost:8000/flight/datasets
+curl http://localhost:8000/flight/raw?country=US&limit=50
+curl http://localhost:8000/flight/benchmark?dataset=raw&runs=3
+```
+
+#### Переменные среды (новые)
+| Переменная       | По умолчанию   | Описание                                   |
+|------------------|----------------|--------------------------------------------|
+| FLIGHT_ADDR      | :5005          | Адрес gRPC-сервера Arrow Flight            |
+| FLIGHT_STORE_LEN | 200            | Максимум батчей в ring-buffer (raw и agg)  |
+| FLIGHT_ENDPOINT  | grpc://localhost:5005 | URL Flight-сервера для Python-клиента |
