@@ -298,3 +298,146 @@ curl http://localhost:8000/flight/benchmark?dataset=raw&runs=3
 | FLIGHT_ADDR      | :5005          | Адрес gRPC-сервера Arrow Flight            |
 | FLIGHT_STORE_LEN | 200            | Максимум батчей в ring-buffer (raw и agg)  |
 | FLIGHT_ENDPOINT  | grpc://localhost:5005 | URL Flight-сервера для Python-клиента |
+
+---
+
+## 2026-05-21 — Задание «Интеграция Rust-библиотеки для валидации»
+
+### Промпт
+> Интеграция Rust-библиотеки для валидации.
+> Написать на Rust библиотеку для валидации данных (например, проверка формата полей,
+> диапазонов значений). Встроить её в Go-сборщик через cgo или в Python-анализатор
+> через PyO3.
+
+### Результат
+
+#### Новые файлы
+| Файл | Назначение |
+|------|-----------|
+| `validator/Cargo.toml`             | Crate: cdylib + staticlib, PyO3 как опциональная фича |
+| `validator/pyproject.toml`         | Maturin-конфиг для сборки Python-колеса |
+| `validator/src/types.rs`           | `ValidationError`, `ValidationResult`, `errors_to_json()` |
+| `validator/src/rules.rs`           | 5 правил: country_code, parameter, value, coordinates, timestamp |
+| `validator/src/lib.rs`             | Публичный API + C FFI (`#[no_mangle]`) + PyO3-модуль (`#[cfg(feature="python")]`) |
+| `validator/validator.h`            | C-заголовок для cgo: `CValidationResult`, `validate_measurement_c`, `free_validation_result` |
+| `collector/internal/validator/validator.go` | Общие типы + публичный API `FilterMeasurements` |
+| `collector/internal/validator/cgo.go`       | `//go:build rust_validator` — реализация через cgo |
+| `collector/internal/validator/stub.go`      | `//go:build !rust_validator` — заглушка (пропускает всё) |
+
+#### Изменённые файлы
+| Файл | Что изменилось |
+|------|---------------|
+| `collector/cmd/collector/main.go`  | `validator.FilterMeasurements()` после `FetchMeasurements()`, логирование `validation_filter` |
+| `docker/Dockerfile.collector`      | Трёхэтапная сборка: rust-builder → go-builder (CGO=1, -tags rust_validator) → debian-slim |
+| `docker/Dockerfile.analysis`       | Двухэтапная сборка: maturin wheel-builder → python:3.11-slim + pip install wheel |
+| `docker-compose.yml`               | Контекст всех сервисов изменён с `./collector`/`./analysis` на `.` (корень проекта) |
+| `Makefile`                         | Новые цели: `build-rust-cgo`, `build-rust-py`; `build` зависит от `build-rust-cgo` |
+| `analysis/requirements.txt`        | Добавлен `maturin>=1.5,<2` |
+| `analysis/api/main.py`             | Graceful import `air_quality_validator`, `_is_valid_row()`, фильтрация в `handle_raw`, `/validator/info` |
+
+#### Архитектура Rust-библиотеки
+
+```
+validator/src/
+  types.rs    — ValidationError { field, message }
+                ValidationResult { valid, errors }
+                errors_to_json() — ручная JSON-сериализация (без serde)
+
+  rules.rs    — validate_country_code : 2 заглавных ASCII буквы (ISO 3166-1)
+                validate_parameter    : непустая строка; неизвестные параметры ≠ ошибка
+                validate_value        : конечное число + в диапазоне для параметра:
+                    pm25 [0,2000], pm10 [0,3000], o3 [0,600], no2/so2 [0,2000],
+                    co [0,100000], bc [0,200], humidity [0,100],
+                    temperature [-100,100], pressure [80000,110000]
+                validate_coordinates  : lat ∈ [-90,90], lon ∈ [-180,180]
+                validate_timestamp    : не >5 мин в будущем, не >30 дней в прошлом
+
+  lib.rs      — validate_measurement() / validate_batch() — чистый Rust
+                C FFI: CValidationResult { valid: i32, errors_json: *mut c_char }
+                       validate_measurement_c(…) → CValidationResult
+                       free_validation_result(…)
+                PyO3:  PyValidationError, PyValidationResult,
+                       validate_measurement_py(), validate_batch_py(),
+                       validate_columns() — колоночная валидация для pandas
+```
+
+#### Встройка в Go (cgo)
+
+```
+make build-rust-cgo
+  └─ cargo build --release --no-default-features
+     → libair_quality_validator.a
+  └─ cp .a + validator.h → collector/internal/validator/
+
+CGO_ENABLED=1 go build -tags rust_validator ./cmd/collector
+  → cgo.go: #cgo LDFLAGS: -L${SRCDIR} -lair_quality_validator -ldl -lm
+             validate_measurement_c(cc, param, value, lat, lon, ts_us)
+```
+
+#### Встройка в Python (PyO3 / maturin)
+
+```
+make build-rust-py
+  └─ maturin build --release --features python --out target/wheels
+  └─ pip install target/wheels/air_quality_validator-*.whl
+
+import air_quality_validator as aqv
+r = aqv.validate_measurement_py("US", "pm25", 42.0, 40.7, -74.0, ts_us)
+print(r.valid, r.errors)
+```
+
+#### Конвейер валидации в Go-сборщике
+
+```
+FetchMeasurements(ctx, country)
+  └─ validator.FilterMeasurements(measurements)
+       ├─ [rust_validator tag] CValidationResult via validate_measurement_c
+       └─ [stub] pass-through (valid = all)
+  └─ schema.BuildRecord(valid_measurements)
+  └─ flightSrv.AddRaw / publisher.Publish / window.Add
+```
+
+#### Конвейер валидации в Python-анализаторе
+
+```
+NATS air.quality.* → handle_raw()
+  └─ _decode_arrow() → rows (list[dict])
+  └─ [if _HAS_VALIDATOR] _is_valid_row() per row → air_quality_validator.validate_measurement_py()
+  └─ raw_store.extend(valid_rows)
+  └─ _validation_stats["validated"] / ["invalid"] += …
+```
+
+#### Метрики производительности (новые)
+
+Go-лог при наличии отбракованных записей:
+```json
+{
+  "msg": "validation_filter",
+  "country": "US",
+  "valid": 298,
+  "invalid": 14
+}
+```
+
+Python REST:
+```
+GET /validator/info
+{
+  "enabled": true,
+  "validated": 1540,
+  "invalid": 23
+}
+```
+
+#### Сборка
+
+```bash
+# Локально:
+make build               # Rust → .a → CGO Go binary
+make build-rust-py       # Rust → PyO3 wheel
+pip install validator/target/wheels/*.whl
+
+# Docker (автоматически):
+make run-local           # docker compose up --build (multi-stage)
+make k8s-build-images    # docker build с project-root context
+```

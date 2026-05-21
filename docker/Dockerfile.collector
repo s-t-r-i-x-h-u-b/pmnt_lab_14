@@ -1,10 +1,32 @@
-FROM golang:1.21-alpine AS builder
-WORKDIR /app
-# Copy all source first so go mod tidy can resolve imports
-COPY . .
-RUN go mod tidy && CGO_ENABLED=0 GOOS=linux go build -ldflags="-s -w" -o /collector ./cmd/collector
+# Stage 1 — Build Rust static library (no Python feature, pure staticlib)
+FROM rust:1.78-slim AS rust-builder
+WORKDIR /validator
+COPY validator/ .
+RUN cargo build --release --no-default-features
 
-FROM alpine:3.19
-RUN apk add --no-cache ca-certificates tzdata
-COPY --from=builder /collector /collector
+# Stage 2 — Build Go binary with cgo + Rust validator linked in
+FROM golang:1.21 AS go-builder
+RUN apt-get update && \
+    apt-get install -y --no-install-recommends gcc libc-dev && \
+    rm -rf /var/lib/apt/lists/*
+WORKDIR /app
+
+# Place the static lib and its C header where cgo SRCDIR will find them
+COPY --from=rust-builder \
+    /validator/target/release/libair_quality_validator.a \
+    /app/collector/internal/validator/libair_quality_validator.a
+COPY validator/validator.h /app/collector/internal/validator/validator.h
+
+COPY collector/ ./collector/
+WORKDIR /app/collector
+RUN go mod tidy && \
+    CGO_ENABLED=1 GOOS=linux \
+    go build -tags rust_validator -ldflags="-s -w" -o /collector ./cmd/collector
+
+# Stage 3 — Minimal runtime image
+FROM debian:bookworm-slim
+RUN apt-get update && \
+    apt-get install -y --no-install-recommends ca-certificates tzdata && \
+    rm -rf /var/lib/apt/lists/*
+COPY --from=go-builder /collector /collector
 ENTRYPOINT ["/collector"]

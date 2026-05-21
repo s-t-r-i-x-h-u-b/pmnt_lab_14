@@ -37,8 +37,8 @@ services:
 
   collector-1:
     build:
-      context: ./collector
-      dockerfile: ../docker/Dockerfile.collector
+      context: .
+      dockerfile: docker/Dockerfile.collector
     environment:
       ETCD_ENDPOINTS: http://etcd:2379
       NATS_URL: nats://nats:4222
@@ -62,8 +62,8 @@ services:
 
   collector-2:
     build:
-      context: ./collector
-      dockerfile: ../docker/Dockerfile.collector
+      context: .
+      dockerfile: docker/Dockerfile.collector
     environment:
       ETCD_ENDPOINTS: http://etcd:2379
       NATS_URL: nats://nats:4222
@@ -87,8 +87,8 @@ services:
 
   collector-3:
     build:
-      context: ./collector
-      dockerfile: ../docker/Dockerfile.collector
+      context: .
+      dockerfile: docker/Dockerfile.collector
     environment:
       ETCD_ENDPOINTS: http://etcd:2379
       NATS_URL: nats://nats:4222
@@ -112,8 +112,8 @@ services:
 
   analysis-api:
     build:
-      context: ./analysis
-      dockerfile: ../docker/Dockerfile.analysis
+      context: .
+      dockerfile: docker/Dockerfile.analysis
     command: uvicorn api.main:app --host 0.0.0.0 --port 8000 --reload
     environment:
       NATS_URL: nats://nats:4222
@@ -128,8 +128,8 @@ services:
 
   dashboard:
     build:
-      context: ./analysis
-      dockerfile: ../docker/Dockerfile.analysis
+      context: .
+      dockerfile: docker/Dockerfile.analysis
     command: streamlit run dashboard/app.py --server.port=8501 --server.address=0.0.0.0
     environment:
       API_URL: http://analysis-api:8000

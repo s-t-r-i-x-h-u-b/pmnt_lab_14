@@ -1,0 +1,24 @@
+[package]
+name    = "air_quality_validator"
+version = "0.1.0"
+edition = "2021"
+
+[lib]
+name = "air_quality_validator"
+# staticlib  -> libair_quality_validator.a for Go cgo
+# cdylib     -> libair_quality_validator.so for Python (maturin)
+crate-type = ["cdylib", "staticlib"]
+
+[features]
+default = ["python"]
+python  = ["pyo3/extension-module"]
+
+[dependencies]
+pyo3   = { version = "0.21", optional = true }
+chrono = { version = "0.4", default-features = false, features = ["std", "clock"] }
+
+[profile.release]
+opt-level     = 3
+lto           = true
+codegen-units = 1
+strip         = true

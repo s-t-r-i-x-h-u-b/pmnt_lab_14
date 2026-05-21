@@ -23,6 +23,7 @@ import (
 	"pmnt_lab14/collector/internal/metrics"
 	"pmnt_lab14/collector/internal/publisher"
 	"pmnt_lab14/collector/internal/schema"
+	"pmnt_lab14/collector/internal/validator"
 )
 
 var allShards = []string{
@@ -218,6 +219,19 @@ func (a *App) fetchAndPublish(ctx context.Context, country string) {
 		return
 	}
 	fetchDuration := time.Since(start)
+
+	// Validate measurements via Rust library (no-op stub when not linked).
+	measurements, invalidCount := validator.FilterMeasurements(measurements)
+	if invalidCount > 0 {
+		a.logger.Info("validation_filter",
+			zap.String("country", country),
+			zap.Int("valid", len(measurements)),
+			zap.Int("invalid", invalidCount),
+		)
+	}
+	if len(measurements) == 0 {
+		return
+	}
 
 	// Build one Arrow Record shared by Flight and (optionally) NATS encode.
 	rawRec, err := schema.BuildRecord(measurements)

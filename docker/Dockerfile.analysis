@@ -1,5 +1,14 @@
+# Stage 1 — Build PyO3 wheel with maturin
+FROM ghcr.io/pyo3/maturin:latest AS wheel-builder
+WORKDIR /validator
+COPY validator/ .
+RUN maturin build --release --features python --out /wheels
+
+# Stage 2 — Python runtime with the compiled wheel installed
 FROM python:3.11-slim
 WORKDIR /app
-COPY requirements.txt .
+COPY analysis/requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
-COPY . .
+COPY --from=wheel-builder /wheels/*.whl /wheels/
+RUN pip install --no-cache-dir /wheels/*.whl && rm -rf /wheels
+COPY analysis/ .

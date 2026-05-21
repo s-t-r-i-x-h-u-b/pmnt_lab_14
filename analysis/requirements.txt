@@ -7,3 +7,4 @@ streamlit==1.38.0
 plotly==5.24.1
 requests==2.32.3
 aiohttp==3.10.5
+maturin>=1.5,<2

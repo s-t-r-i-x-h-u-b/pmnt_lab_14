@@ -1,0 +1,14 @@
+[build-system]
+requires      = ["maturin>=1.5,<2"]
+build-backend = "maturin"
+
+[project]
+name        = "air_quality_validator"
+version     = "0.1.0"
+description = "Rust-backed validation for air quality measurements"
+requires-python = ">=3.9"
+
+[tool.maturin]
+features       = ["python"]
+module-name    = "air_quality_validator"
+python-source  = "python"

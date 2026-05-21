@@ -1,7 +1,7 @@
 """FastAPI service.
 
 Data sources:
-  - NATS  air.quality.*  → raw measurements store
+  - NATS  air.quality.*  → raw measurements store (validated via Rust library)
   - NATS  air.agg.*      → aggregated window store
   - Arrow Flight         → direct pull from Go collector (via /flight/* endpoints)
 """
@@ -16,9 +16,9 @@ import nats
 import pyarrow as pa
 from fastapi import FastAPI, Query
 
-NATS_URL      = os.getenv("NATS_URL",        "nats://localhost:4222")
+NATS_URL        = os.getenv("NATS_URL",        "nats://localhost:4222")
 FLIGHT_ENDPOINT = os.getenv("FLIGHT_ENDPOINT", "grpc://localhost:5005")
-MAX_RECORDS   = int(os.getenv("MAX_RECORDS",  "50000"))
+MAX_RECORDS     = int(os.getenv("MAX_RECORDS",  "50000"))
 
 raw_store: deque[dict[str, Any]] = deque(maxlen=MAX_RECORDS)
 agg_store: deque[dict[str, Any]] = deque(maxlen=MAX_RECORDS)
@@ -27,6 +27,50 @@ agg_lock = asyncio.Lock()
 
 nc_handle: nats.aio.client.Client | None = None
 
+# ── Rust validator (PyO3 wheel, optional) ─────────────────────────────────────
+
+try:
+    import air_quality_validator as _aqv  # type: ignore[import]
+    _HAS_VALIDATOR = True
+except ImportError:
+    _aqv = None  # type: ignore[assignment]
+    _HAS_VALIDATOR = False
+
+_validation_stats: dict[str, Any] = {
+    "enabled":   _HAS_VALIDATOR,
+    "validated": 0,
+    "invalid":   0,
+}
+
+
+def _is_valid_row(row: dict[str, Any]) -> bool:
+    """Return True if the row passes Rust validation (or if validator absent)."""
+    if not _HAS_VALIDATOR:
+        return True
+    ts = row.get("timestamp")
+    try:
+        import pandas as _pd
+        if isinstance(ts, _pd.Timestamp):
+            ts_us = ts.value // 1000  # nanoseconds → microseconds
+        else:
+            ts_us = int(ts or 0)
+    except Exception:
+        ts_us = 0
+    try:
+        r = _aqv.validate_measurement_py(
+            str(row.get("country_code") or ""),
+            str(row.get("parameter")    or ""),
+            float(row.get("value")      or 0.0),
+            float(row.get("latitude")   or 0.0),
+            float(row.get("longitude")  or 0.0),
+            int(ts_us),
+        )
+        return bool(r.valid)
+    except Exception:
+        return True
+
+
+# ── Arrow IPC decode ──────────────────────────────────────────────────────────
 
 def _decode_arrow(data: bytes) -> list[dict[str, Any]]:
     reader = pa.ipc.open_stream(io.BytesIO(data))
@@ -36,10 +80,17 @@ def _decode_arrow(data: bytes) -> list[dict[str, Any]]:
     return rows
 
 
+# ── NATS message handlers ─────────────────────────────────────────────────────
+
 async def handle_raw(msg: nats.aio.msg.Msg) -> None:
     try:
+        rows = _decode_arrow(msg.data)
+        valid_rows = [r for r in rows if _is_valid_row(r)]
         async with raw_lock:
-            raw_store.extend(_decode_arrow(msg.data))
+            raw_store.extend(valid_rows)
+        if _HAS_VALIDATOR:
+            _validation_stats["validated"] += len(rows)
+            _validation_stats["invalid"]   += len(rows) - len(valid_rows)
     except Exception as exc:
         print(f"[raw] decode error: {exc}")
 
@@ -60,6 +111,7 @@ async def lifespan(app: FastAPI):  # noqa: ANN001
     await nc_handle.subscribe("air.agg.*",     cb=handle_agg)
     print(f"[startup] NATS connected: {NATS_URL}")
     print(f"[startup] Flight endpoint: {FLIGHT_ENDPOINT}")
+    print(f"[startup] Rust validator: {'enabled' if _HAS_VALIDATOR else 'disabled (wheel not installed)'}")
     yield
     if nc_handle:
         await nc_handle.drain()
@@ -114,8 +166,13 @@ async def get_stats() -> dict[str, Any]:
         parameters = sorted({r.get("parameter")    for r in raw_store if r.get("parameter")})
     async with agg_lock:
         agg_total = len(agg_store)
-    return {"raw_records": raw_total, "agg_records": agg_total,
-            "countries": countries, "parameters": parameters}
+    return {
+        "raw_records": raw_total,
+        "agg_records": agg_total,
+        "countries":   countries,
+        "parameters":  parameters,
+        "validation":  dict(_validation_stats),
+    }
 
 
 @app.get("/aggregated/stats")
@@ -135,6 +192,14 @@ async def get_agg_stats() -> dict[str, Any]:
         mv = v.pop("mean_values")
         v["overall_mean"] = sum(mv) / len(mv) if mv else None
     return by_param
+
+
+# ── Validator endpoint ────────────────────────────────────────────────────────
+
+@app.get("/validator/info")
+async def validator_info() -> dict[str, Any]:
+    """Return Rust validator status and cumulative validation counts."""
+    return dict(_validation_stats)
 
 
 # ── Arrow Flight endpoints ────────────────────────────────────────────────────
@@ -246,11 +311,11 @@ async def flight_benchmark(
     avg_rows  = sum(rows_list) / len(rows_list)
     avg_bytes = sum(bytes_list) / len(bytes_list)
     return {
-        "dataset":              dataset,
-        "runs":                 runs,
-        "avg_rows":             avg_rows,
-        "avg_bytes":            avg_bytes,
-        "avg_latency_ms":       round(avg_lat, 2),
-        "throughput_rows_s":    round(avg_rows  / (avg_lat / 1000), 1) if avg_lat else 0,
-        "throughput_mb_s":      round(avg_bytes / (avg_lat / 1000) / 1e6, 3) if avg_lat else 0,
+        "dataset":           dataset,
+        "runs":              runs,
+        "avg_rows":          avg_rows,
+        "avg_bytes":         avg_bytes,
+        "avg_latency_ms":    round(avg_lat, 2),
+        "throughput_rows_s": round(avg_rows  / (avg_lat / 1000), 1) if avg_lat else 0,
+        "throughput_mb_s":   round(avg_bytes / (avg_lat / 1000) / 1e6, 3) if avg_lat else 0,
     }
