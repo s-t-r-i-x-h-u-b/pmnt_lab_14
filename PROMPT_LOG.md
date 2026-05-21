@@ -633,3 +633,148 @@ streamlit run analysis/dashboard/app.py
 
 **Вывод**: Python async выигрывает при I/O-bound нагрузке за счёт параллелизма.
 Go выигрывает по памяти, CPU и предсказуемой задержке (нет GC-пауз).
+
+---
+
+## 2026-05-21 — Задание «Обработка потоковых данных (Kafka)»
+
+### Промпт
+> Обработка потоковых данных (Kafka).
+> Заменить промежуточное хранение в JSON на потоковую передачу через Kafka (или NATS).
+> Go-сборщик пишет в топик, Python-анализатор читает из топика и обрабатывает
+> в реальном времени. Добавить оконную обработку (скользящее окно в 5 минут).
+
+### Результат
+
+#### Новые файлы
+| Файл | Назначение |
+|------|-----------|
+| `collector/internal/kafkaproducer/producer.go` | Kafka-продюсер (segmentio/kafka-go): топики raw+agg, Hash балансировщик |
+| `analysis/kafka_consumer/__init__.py`          | Пакет-инициализатор |
+| `analysis/kafka_consumer/consumer.py`          | SlidingWindow + daemon-thread KafkaConsumer + asyncio drain loop |
+| `k8s/kafka.yaml`                               | StatefulSet bitnami/kafka:3.7 (KRaft) + headless Service |
+
+#### Изменённые файлы
+| Файл | Что изменилось |
+|------|---------------|
+| `collector/cmd/collector/main.go` | KAFKA_BROKERS env, kafkaproducer.New(), kafka.PublishRaw/PublishAgg |
+| `collector/go.mod`                | Добавлена зависимость github.com/segmentio/kafka-go v0.4.47 |
+| `analysis/api/main.py`            | Импорт kafka_consumer, lifespan start/stop, 4 эндпоинта /kafka/* |
+| `analysis/dashboard/app.py`       | Вкладка «Kafka sliding window»: bar chart, scatter, window summary |
+| `docker-compose.yml`              | Сервис kafka (bitnami/kafka:3.7 KRaft), KAFKA_BROKERS во всех сервисах |
+| `k8s/collector.yaml`              | KAFKA_BROKERS: kafka:9092 |
+| `k8s/analysis.yaml`               | KAFKA_BROKERS: kafka:9092, FLIGHT_ENDPOINT |
+| `Makefile`                        | kafka.yaml в k8s-deploy, цели kafka-topics/kafka-logs/kafka-consume |
+
+#### Архитектура потоковой обработки
+
+```
+Go collector
+  fetchAndPublish()
+    └─ kafka.PublishRaw(measurements)   → топик air.measurements.raw
+                                           ключ = country_code (Hash partitioner)
+  publishAggregated()
+    └─ kafka.PublishAgg(aggRecords)     → топик air.measurements.agg
+
+Kafka broker (KRaft, 4 партиции)
+  air.measurements.raw   — JSON: {location_id, country_code, parameter, value,
+                                   unit, timestamp_us, collector_id, …}
+  air.measurements.agg   — JSON: {window_start, window_end, country_code,
+                                   parameter, count, mean_value, …}
+
+Python analysis-api
+  _consumer_thread (daemon)
+    └─ kafka-python KafkaConsumer
+         group_id=analysis-sliding-window, auto_offset_reset=latest
+         → _msg_queue (threading.Queue, maxsize=20000)
+  asyncio _drain_loop (каждые 100 мс)
+    └─ _process_message(topic, value)
+         └─ sliding_window.add(country, parameter, value, ts_us)
+```
+
+#### Скользящее 5-минутное окно (SlidingWindow)
+
+```
+Структура:
+  _buckets: dict[(country_code, parameter)] → deque[(ts_us, value)]
+  _win_us = 5 * 60 * 1_000_000
+
+add(country, param, value, ts_us)
+  → append (ts_us, value) в нужный bucket
+
+compute() → list[WindowStats]
+  now_us = time.time() * 1e6
+  cutoff  = now_us - _win_us
+  для каждого bucket:
+    popleft() пока dq[0][0] < cutoff   ← вытеснение устаревших
+    vals = [v for _, v in dq]
+    → WindowStats(count, mean, min, max, std, window_start_us=cutoff)
+```
+
+Тип события — event-time: `timestamp_us` из сообщения Kafka, не время получения.
+Вытеснение по wall-clock для предотвращения утечки памяти при задержках продюсера.
+
+#### REST API (новые эндпоинты)
+
+| Метод GET | Описание |
+|-----------|---------|
+| `/kafka/stats` | Счётчики: enabled, raw_total, agg_total, errors, window_entries |
+| `/kafka/window` | Текущее окно: список WindowStats (фильтры: country, parameter) |
+| `/kafka/window/countries` | Страны с данными в текущем окне |
+| `/kafka/window/summary` | По-параметровая сводка: count_total, country_count, overall_mean |
+
+#### Kafka-конфигурация (KRaft, без Zookeeper)
+
+```yaml
+KAFKA_CFG_PROCESS_ROLES: controller,broker
+KAFKA_CFG_LISTENERS:     PLAINTEXT://:9092,CONTROLLER://:9093
+KAFKA_CFG_NUM_PARTITIONS: "4"
+KAFKA_CFG_LOG_RETENTION_HOURS: "2"
+```
+
+Продюсер (Go):
+- `Balancer: kafka.Hash{}` — детерминированная маршрутизация по country_code
+- `Async: true` — не блокирует pipeline
+- `AllowAutoTopicCreation: true` — топики создаются автоматически
+
+Консьюмер (Python):
+- `group_id=analysis-sliding-window` — один consumer group, offset auto-commit
+- `max_poll_records=500`, `session_timeout_ms=30000`
+- Авто-реконнект: бесконечный retry-loop с sleep(5) при ошибке
+
+#### Запуск
+
+```bash
+# Docker Compose:
+make run-local
+
+# Посмотреть топики:
+make kafka-topics
+
+# Последние 20 сообщений raw:
+make kafka-logs
+
+# Live-monitor:
+make kafka-consume TOPIC=air.measurements.raw
+
+# API:
+curl http://localhost:8000/kafka/stats
+curl http://localhost:8000/kafka/window?country=US
+curl http://localhost:8000/kafka/window/summary
+
+# Kubernetes:
+make k8s-deploy   # включает kafka.yaml
+```
+
+#### Переменные среды (новые)
+| Переменная    | По умолчанию | Описание                               |
+|---------------|-------------|----------------------------------------|
+| KAFKA_BROKERS | (пусто)     | Список брокеров; пусто → Kafka отключена |
+
+#### Оценка производительности
+
+Kafka-топик с Hash-балансировщиком обеспечивает:
+- **Пропускная способность**: async producer не добавляет задержку к pipeline
+- **Объём сообщений**: каждое измерение — JSON ~200–400 байт; для 500 записей/цикл ≈ 100–200 КБ/цикл
+- **Задержка end-to-end**: poll interval 150ms (Go) + queue drain 100ms (Python) ≈ ~250ms
+- **Скользящее окно**: вычисление O(N) по активным записям в окне; на 10 стран × 5 параметров × 300 записей ≈ 15000 elem. → <1ms на compute()

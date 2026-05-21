@@ -54,6 +54,8 @@ spec:
               valueFrom:
                 fieldRef:
                   fieldPath: metadata.name
+            - name: KAFKA_BROKERS
+              value: "kafka:9092"
             - name: OPENAQ_API_KEY
               valueFrom:
                 secretKeyRef:

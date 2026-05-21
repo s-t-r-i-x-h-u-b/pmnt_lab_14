@@ -21,6 +21,7 @@ import (
 	"pmnt_lab14/collector/internal/coordinator"
 	"pmnt_lab14/collector/internal/fetcher"
 	"pmnt_lab14/collector/internal/flightserver"
+	"pmnt_lab14/collector/internal/kafkaproducer"
 	"pmnt_lab14/collector/internal/metrics"
 	"pmnt_lab14/collector/internal/publisher"
 	"pmnt_lab14/collector/internal/schema"
@@ -68,6 +69,8 @@ func main() {
 	publishRaw     := getenv("PUBLISH_RAW", "true") == "true"
 	flightAddr     := getenv("FLIGHT_ADDR", ":5005")
 	flightStoreLen := parseInt(getenv("FLIGHT_STORE_LEN", "200"), 200)
+	kafkaBrokers   := strings.Split(getenv("KAFKA_BROKERS", ""), ",")
+	kafkaEnabled   := getenv("KAFKA_BROKERS", "") != ""
 
 	logger.Info("Starting collector",
 		zap.String("id", instanceID),
@@ -78,6 +81,8 @@ func main() {
 		zap.Int("window_max_size", windowMaxSize),
 		zap.Bool("publish_raw", publishRaw),
 		zap.String("flight_addr", flightAddr),
+		zap.Bool("kafka_enabled", kafkaEnabled),
+		zap.Strings("kafka_brokers", kafkaBrokers),
 	)
 
 	etcdCli, err := clientv3.New(clientv3.Config{
@@ -102,6 +107,14 @@ func main() {
 	}
 	defer flightSrv.Stop()
 
+	// Kafka producer (optional — disabled when KAFKA_BROKERS is unset).
+	var kafkaProd *kafkaproducer.Producer
+	if kafkaEnabled {
+		kafkaProd = kafkaproducer.New(kafkaBrokers, logger)
+		defer kafkaProd.Close()
+		logger.Info("Kafka producer started", zap.Strings("brokers", kafkaBrokers))
+	}
+
 	host, _ := os.Hostname()
 	coord := coordinator.New(etcdCli, instanceID, coordinator.Info{
 		ID:        instanceID,
@@ -119,6 +132,7 @@ func main() {
 		id:         instanceID,
 		fetcher:    fetcher.NewClient(openAQKey),
 		publisher:  publisher.New(nc),
+		kafka:      kafkaProd,
 		metrics:    metrics.New(),
 		interval:   fetchInterval,
 		window:     win,
@@ -219,6 +233,7 @@ type App struct {
 	id         string
 	fetcher    *fetcher.Client
 	publisher  *publisher.Publisher
+	kafka      *kafkaproducer.Producer  // nil when Kafka disabled
 	metrics    *metrics.Collector
 	interval   time.Duration
 	window     *aggregator.Window
@@ -303,6 +318,11 @@ func (a *App) fetchAndPublish(ctx context.Context, country string) {
 		)
 	}
 
+	// Publish each measurement to Kafka (JSON, one message per record).
+	if a.kafka != nil {
+		a.kafka.PublishRaw(ctx, measurements)
+	}
+
 	a.window.Add(measurements...)
 }
 
@@ -334,6 +354,11 @@ func (a *App) publishAggregated(ctx context.Context, records []aggregator.AggRec
 			continue
 		}
 		totalBytes += b
+	}
+
+	// Publish aggregated records to Kafka as well.
+	if a.kafka != nil {
+		a.kafka.PublishAgg(ctx, records)
 	}
 
 	r := a.metrics.RecordFlush(rawCount, len(records), totalBytes)

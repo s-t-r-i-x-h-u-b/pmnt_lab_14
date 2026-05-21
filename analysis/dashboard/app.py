@@ -52,9 +52,9 @@ c3.metric("Countries",  len(stats.get("countries",  [])))
 c4.metric("Parameters", len(stats.get("parameters", [])))
 
 # ── Tabs ──────────────────────────────────────────────────────────────────────
-tab_raw, tab_agg, tab_flight, tab_cmp, tab_bench = st.tabs([
+tab_raw, tab_agg, tab_flight, tab_cmp, tab_kafka, tab_bench = st.tabs([
     "Raw measurements", "Aggregated windows", "Arrow Flight (direct)", "Compression",
-    "Go vs Python",
+    "Kafka sliding window", "Go vs Python",
 ])
 
 # ── Raw tab ───────────────────────────────────────────────────────────────────
@@ -196,6 +196,103 @@ with tab_cmp:
                                    title="Overall mean per parameter"),
                             use_container_width=True)
         st.caption("Each window compresses N raw readings into one row per (country, parameter).")
+
+# ── Kafka sliding window tab ──────────────────────────────────────────────────
+with tab_kafka:
+    st.subheader("Kafka — скользящее окно 5 минут")
+
+    kstats = fetch_obj("/kafka/stats")
+    if not kstats.get("enabled"):
+        st.warning(
+            "Kafka-консьюмер не запущен.  Установите переменную окружения "
+            "`KAFKA_BROKERS=kafka:9092` для analysis-api."
+        )
+    else:
+        k1, k2, k3, k4 = st.columns(4)
+        k1.metric("Raw сообщений",      kstats.get("raw_total", 0))
+        k2.metric("Agg сообщений",      kstats.get("agg_total", 0))
+        k3.metric("Записей в окне",     kstats.get("window_entries", 0))
+        k4.metric("Ошибок декодирования", kstats.get("errors", 0))
+
+        st.caption(
+            f"Скользящее окно: последние **{kstats.get('window_duration_s', 300) // 60} мин** "
+            f"по event-time.  Последняя страна: **{kstats.get('last_raw_country', '—')}**"
+        )
+
+        # ── Window data table + charts ────────────────────────────────────────
+        win_data = fetch("/kafka/window", country=country_arg, parameter=parameter_arg)
+        df_win   = pd.DataFrame(win_data)
+
+        if df_win.empty:
+            st.info("Нет данных в скользящем окне — подождите первых сообщений от Kafka.")
+        else:
+            for col in ("mean_value", "min_value", "max_value", "std_value"):
+                df_win[col] = pd.to_numeric(df_win[col], errors="coerce")
+
+            st.markdown("#### Средние значения в скользящем окне")
+            fig_mean = px.bar(
+                df_win.sort_values("mean_value", ascending=False),
+                x="parameter", y="mean_value", color="country_code",
+                barmode="group",
+                error_y="std_value",
+                title="Среднее ± σ по параметрам (скользящее окно 5 мин)",
+                labels={"mean_value": "Среднее значение", "parameter": "Параметр"},
+            )
+            st.plotly_chart(fig_mean, use_container_width=True)
+
+            st.markdown("#### Количество измерений по (страна, параметр)")
+            fig_cnt = px.bar(
+                df_win.sort_values("count", ascending=False).head(30),
+                x="parameter", y="count", color="country_code",
+                barmode="stack",
+                title="Измерений в окне по параметрам",
+            )
+            st.plotly_chart(fig_cnt, use_container_width=True)
+
+            st.markdown("#### Min / Max разброс")
+            fig_range = go.Figure()
+            for _, row in df_win.iterrows():
+                label = f"{row['country_code']}/{row['parameter']}"
+                fig_range.add_trace(go.Scatter(
+                    x=[label, label],
+                    y=[row["min_value"], row["max_value"]],
+                    mode="lines+markers",
+                    name=label,
+                    showlegend=False,
+                    line=dict(width=3),
+                ))
+            fig_range.update_layout(
+                title="Диапазон min–max по парам (страна, параметр)",
+                xaxis_tickangle=-45,
+                height=400,
+            )
+            st.plotly_chart(fig_range, use_container_width=True)
+
+            with st.expander("Таблица скользящего окна"):
+                st.dataframe(df_win)
+
+        # ── Summary by parameter ──────────────────────────────────────────────
+        win_sum = fetch_obj("/kafka/window/summary")
+        if win_sum:
+            st.markdown("#### Сводка по параметрам (все страны)")
+            sum_rows = [
+                {
+                    "Параметр": p,
+                    "Стран в окне": v.get("country_count", 0),
+                    "Всего измерений": v.get("count_total", 0),
+                    "Среднее": v.get("overall_mean"),
+                }
+                for p, v in win_sum.items()
+            ]
+            st.dataframe(pd.DataFrame(sum_rows).sort_values("Всего измерений", ascending=False))
+
+        st.caption(
+            "📌 Скользящее окно (sliding window): в любой момент времени содержит "
+            "измерения с event-time в диапазоне [now − 5 мин, now].  "
+            "В отличие от тамблинг-окна Go (фиксированные 60-секундные интервалы), "
+            "скользящее окно даёт актуальную статистику без задержки."
+        )
+
 
 # ── Go vs Python benchmark tab ───────────────────────────────────────────────
 with tab_bench:

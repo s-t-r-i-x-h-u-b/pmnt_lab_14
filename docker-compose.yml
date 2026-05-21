@@ -1,6 +1,29 @@
 version: "3.9"
 
 services:
+  kafka:
+    image: bitnami/kafka:3.7
+    environment:
+      KAFKA_CFG_NODE_ID: "0"
+      KAFKA_CFG_PROCESS_ROLES: controller,broker
+      KAFKA_CFG_LISTENERS: PLAINTEXT://:9092,CONTROLLER://:9093
+      KAFKA_CFG_ADVERTISED_LISTENERS: PLAINTEXT://kafka:9092
+      KAFKA_CFG_LISTENER_SECURITY_PROTOCOL_MAP: CONTROLLER:PLAINTEXT,PLAINTEXT:PLAINTEXT
+      KAFKA_CFG_CONTROLLER_QUORUM_VOTERS: 0@kafka:9093
+      KAFKA_CFG_CONTROLLER_LISTENER_NAMES: CONTROLLER
+      KAFKA_CFG_AUTO_CREATE_TOPICS_ENABLE: "true"
+      KAFKA_CFG_NUM_PARTITIONS: "4"
+      KAFKA_CFG_DEFAULT_REPLICATION_FACTOR: "1"
+      KAFKA_CFG_LOG_RETENTION_HOURS: "2"
+    ports:
+      - "9092:9092"
+    healthcheck:
+      test: ["CMD-SHELL", "kafka-topics.sh --bootstrap-server localhost:9092 --list"]
+      interval: 15s
+      timeout: 10s
+      retries: 10
+      start_period: 30s
+
   etcd:
     image: gcr.io/etcd-development/etcd:v3.5.14
     command:
@@ -51,6 +74,7 @@ services:
       METRICS_ADDR: ":8080"
       FLIGHT_ADDR: ":5005"
       FLIGHT_STORE_LEN: "200"
+      KAFKA_BROKERS: kafka:9092
     ports:
       - "8081:8080"   # metrics/shards HTTP
       - "5005:5005"   # Arrow Flight gRPC (primary)
@@ -58,6 +82,8 @@ services:
       etcd:
         condition: service_healthy
       nats:
+        condition: service_healthy
+      kafka:
         condition: service_healthy
 
   collector-2:
@@ -117,11 +143,14 @@ services:
     command: uvicorn api.main:app --host 0.0.0.0 --port 8000 --reload
     environment:
       NATS_URL: nats://nats:4222
-      FLIGHT_ENDPOINT: grpc://collector-1:5005  # connect to collector-1 Flight server
+      FLIGHT_ENDPOINT: grpc://collector-1:5005
+      KAFKA_BROKERS: kafka:9092
     ports:
       - "8000:8000"
     depends_on:
       nats:
+        condition: service_healthy
+      kafka:
         condition: service_healthy
       collector-1:
         condition: service_started

@@ -2,6 +2,7 @@
         k8s-deploy k8s-undeploy k8s-build-images \
         k8s-hpa-setup k8s-keda-setup k8s-hpa-status k8s-load-test \
         bench bench-python bench-compare bench-report \
+        kafka-topics kafka-logs kafka-consume \
         clean
 
 # ── Rust library ──────────────────────────────────────────────────────────────
@@ -48,6 +49,7 @@ k8s-build-images: build-rust-cgo
 k8s-deploy:
 	kubectl apply -f k8s/etcd.yaml
 	kubectl apply -f k8s/nats.yaml
+	kubectl apply -f k8s/kafka.yaml
 	kubectl apply -f k8s/collector.yaml
 	kubectl apply -f k8s/analysis.yaml
 	kubectl apply -f k8s/prometheus.yaml
@@ -123,6 +125,27 @@ bench-report:
 	pip install -q plotly
 	python -m benchmark.report
 	@echo "Open: benchmark/results/*.html"
+
+# ── Kafka (local Docker Compose) ─────────────────────────────────────────────
+
+# List Kafka topics (requires running kafka container).
+kafka-topics:
+	docker compose exec kafka kafka-topics.sh \
+	  --bootstrap-server localhost:9092 --list
+
+# Tail the last 20 messages from air.measurements.raw.
+kafka-logs:
+	docker compose exec kafka kafka-console-consumer.sh \
+	  --bootstrap-server localhost:9092 \
+	  --topic air.measurements.raw \
+	  --from-beginning --max-messages 20
+
+# Live-consume a topic; pass TOPIC=air.measurements.agg to override.
+kafka-consume:
+	docker compose exec kafka kafka-console-consumer.sh \
+	  --bootstrap-server localhost:9092 \
+	  --topic $${TOPIC:-air.measurements.raw} \
+	  --from-beginning
 
 # ── Cleanup ───────────────────────────────────────────────────────────────────
 

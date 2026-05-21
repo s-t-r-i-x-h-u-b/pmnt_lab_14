@@ -19,6 +19,7 @@ from fastapi import FastAPI, Query
 NATS_URL        = os.getenv("NATS_URL",        "nats://localhost:4222")
 FLIGHT_ENDPOINT = os.getenv("FLIGHT_ENDPOINT", "grpc://localhost:5005")
 MAX_RECORDS     = int(os.getenv("MAX_RECORDS",  "50000"))
+KAFKA_BROKERS   = os.getenv("KAFKA_BROKERS",   "")   # empty → Kafka disabled
 
 raw_store: deque[dict[str, Any]] = deque(maxlen=MAX_RECORDS)
 agg_store: deque[dict[str, Any]] = deque(maxlen=MAX_RECORDS)
@@ -26,6 +27,9 @@ raw_lock = asyncio.Lock()
 agg_lock = asyncio.Lock()
 
 nc_handle: nats.aio.client.Client | None = None
+
+# ── Kafka consumer + sliding window (optional) ───────────────────────────────
+from kafka_consumer import consumer as _kc
 
 # ── Rust validator (PyO3 wheel, optional) ─────────────────────────────────────
 
@@ -112,7 +116,14 @@ async def lifespan(app: FastAPI):  # noqa: ANN001
     print(f"[startup] NATS connected: {NATS_URL}")
     print(f"[startup] Flight endpoint: {FLIGHT_ENDPOINT}")
     print(f"[startup] Rust validator: {'enabled' if _HAS_VALIDATOR else 'disabled (wheel not installed)'}")
+    if KAFKA_BROKERS:
+        await _kc.start([b.strip() for b in KAFKA_BROKERS.split(",")])
+        print(f"[startup] Kafka consumer started: {KAFKA_BROKERS}")
+    else:
+        print("[startup] Kafka disabled (set KAFKA_BROKERS to enable)")
     yield
+    if KAFKA_BROKERS:
+        _kc.stop()
     if nc_handle:
         await nc_handle.drain()
 
@@ -192,6 +203,60 @@ async def get_agg_stats() -> dict[str, Any]:
         mv = v.pop("mean_values")
         v["overall_mean"] = sum(mv) / len(mv) if mv else None
     return by_param
+
+
+# ── Kafka / sliding-window endpoints ─────────────────────────────────────────
+
+@app.get("/kafka/stats")
+async def kafka_stats_endpoint() -> dict[str, Any]:
+    """Kafka consumer status and cumulative message counts."""
+    stats = dict(_kc.kafka_stats)
+    stats["window_entries"]   = _kc.sliding_window.entry_count()
+    stats["window_duration_s"] = _kc.WINDOW_SECONDS
+    return stats
+
+
+@app.get("/kafka/window")
+async def kafka_window(
+    country:   Optional[str] = Query(None),
+    parameter: Optional[str] = Query(None),
+) -> list[dict[str, Any]]:
+    """Current 5-minute sliding window aggregates from the Kafka stream.
+
+    Returns one entry per (country_code, parameter) pair that has received at
+    least one measurement within the last 5 minutes.
+    """
+    results = _kc.sliding_window.to_dict_list()
+    if country:
+        results = [r for r in results if r.get("country_code") == country]
+    if parameter:
+        results = [r for r in results if r.get("parameter") == parameter]
+    return results
+
+
+@app.get("/kafka/window/countries")
+async def kafka_window_countries() -> list[str]:
+    """Countries that have data in the current sliding window."""
+    return sorted({s["country_code"] for s in _kc.sliding_window.to_dict_list()})
+
+
+@app.get("/kafka/window/summary")
+async def kafka_window_summary() -> dict[str, Any]:
+    """Per-parameter summary across all countries in the current sliding window."""
+    rows = _kc.sliding_window.to_dict_list()
+    by_param: dict[str, dict[str, Any]] = {}
+    for r in rows:
+        p = r["parameter"]
+        e = by_param.setdefault(p, {"count_total": 0, "country_count": 0, "means": []})
+        e["count_total"]  += r["count"]
+        e["country_count"] += 1
+        e["means"].append(r["mean_value"])
+    summary: dict[str, Any] = {}
+    for p, e in by_param.items():
+        means = e.pop("means")
+        e["overall_mean"] = round(sum(means) / len(means), 4) if means else None
+        summary[p] = e
+    return summary
 
 
 # ── Validator endpoint ────────────────────────────────────────────────────────
