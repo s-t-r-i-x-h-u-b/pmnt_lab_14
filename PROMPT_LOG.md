@@ -108,3 +108,89 @@ make k8s-deploy
 | FETCH_INTERVAL   | 5m                    | Интервал опроса на шард         |
 | INSTANCE_ID      | (UUID)                | Идентификатор экземпляра        |
 | METRICS_ADDR     | :8080                 | Адрес HTTP-сервера метрик       |
+| WINDOW_DURATION  | 60s                   | Длина тамблинг-окна (по времени)|
+| WINDOW_MAX_SIZE  | 500                   | Размер окна (по числу записей)  |
+| PUBLISH_RAW      | true                  | Публиковать сырые данные в NATS |
+
+---
+
+## 2026-05-21 — Задание «Оконная агрегация в Go перед отправкой в Python»
+
+### Промпт
+> Оконная агрегация в Go перед отправкой в Python.
+> Добавить в сборщик оконную агрегацию (tumbling window). Например: каждые N секунд
+> или каждые M записей агрегировать данные на стороне Go и отправлять в Python не
+> исходные записи, а уже агрегированные (суммы, средние и т.д.). Это снижает объём
+> передаваемых данных.
+
+### Результат
+
+#### Новые файлы
+| Файл | Назначение |
+|------|-----------|
+| `collector/internal/aggregator/window.go` | Tumbling window: накопление, триггеры (таймер / размер), функция aggregate() |
+| `collector/internal/aggregator/encode.go` | Arrow IPC-схема + кодирование AggRecord |
+
+#### Изменённые файлы
+| Файл | Что изменилось |
+|------|---------------|
+| `publisher.go` | добавлен `PublishAgg` → тема `air.agg.{CC}` |
+| `metrics.go`   | добавлен `FlushResult`, `RecordFlush()`, `Summary` разделён на Fetches/Flushes |
+| `main.go`      | `App.window`, горутина фlusher, `fetchAndPublish` → `window.Add()`, новый эндпоинт `/window` |
+| `api/main.py`  | подписка `air.agg.*`, эндпоинты `/aggregated`, `/aggregated/stats` |
+| `dashboard/app.py` | вкладки «Aggregated windows» и «Compression» |
+| `k8s/collector.yaml` | WINDOW_DURATION, WINDOW_MAX_SIZE, PUBLISH_RAW |
+
+#### Схема тамблинг-окна
+
+```
+fetchAndPublish(country)
+  ├─ FetchMeasurements()  → []Measurement
+  ├─ [если PUBLISH_RAW]   → Publish() → air.quality.{CC}   (Arrow IPC)
+  └─ window.Add(...)
+                            ↓ timer (60 s) или размер ≥ 500
+                         flush()
+                            ↓
+                         aggregate(buf)
+                            ↓  group by (country, parameter)
+                            ↓  count, mean, min, max, std, location_count
+                         PublishAgg() → air.agg.{CC}         (Arrow IPC)
+```
+
+#### Схема Arrow для агрегатов (`AggSchema`)
+```
+window_start   timestamp[us,UTC]
+window_end     timestamp[us,UTC]
+country_code   string
+parameter      string
+unit           string
+count          int64      — кол-во сырых измерений в группе
+mean_value     float64
+min_value      float64
+max_value      float64
+std_value      float64    — стандартное отклонение (популяционное)
+location_count int64      — кол-во уникальных станций
+collector_id   string
+```
+
+#### Метрики производительности (window_flush)
+```json
+{
+  "msg": "window_flush",
+  "raw_records_in":   312,
+  "agg_records_out":   14,
+  "bytes_published": 2048,
+  "compression_ratio": 22.3,
+  "mem_alloc_bytes": 13107200
+}
+```
+`compression_ratio = raw_count / agg_count` — показывает, во сколько раз сжаты данные.
+
+HTTP: `GET :8080/metrics` возвращает `{"fetches":[...], "flushes":[...]}`.
+
+#### Переменные среды (новые)
+| Переменная      | По умолчанию | Описание                                    |
+|-----------------|-------------|---------------------------------------------|
+| WINDOW_DURATION | 60s         | Закрыть окно по истечении этого времени     |
+| WINDOW_MAX_SIZE | 500         | Закрыть окно при накоплении N записей       |
+| PUBLISH_RAW     | true        | Отправлять и сырые данные (доп. трафик)     |

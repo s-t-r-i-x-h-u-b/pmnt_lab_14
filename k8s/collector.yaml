@@ -33,6 +33,12 @@ spec:
               value: "nats://nats:4222"
             - name: FETCH_INTERVAL
               value: "5m"
+            - name: WINDOW_DURATION
+              value: "60s"
+            - name: WINDOW_MAX_SIZE
+              value: "500"
+            - name: PUBLISH_RAW
+              value: "true"
             - name: METRICS_ADDR
               value: ":8080"
             - name: INSTANCE_ID
