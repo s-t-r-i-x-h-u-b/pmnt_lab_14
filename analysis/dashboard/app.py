@@ -52,8 +52,9 @@ c3.metric("Countries",  len(stats.get("countries",  [])))
 c4.metric("Parameters", len(stats.get("parameters", [])))
 
 # ── Tabs ──────────────────────────────────────────────────────────────────────
-tab_raw, tab_agg, tab_flight, tab_cmp = st.tabs([
+tab_raw, tab_agg, tab_flight, tab_cmp, tab_bench = st.tabs([
     "Raw measurements", "Aggregated windows", "Arrow Flight (direct)", "Compression",
+    "Go vs Python",
 ])
 
 # ── Raw tab ───────────────────────────────────────────────────────────────────
@@ -195,6 +196,140 @@ with tab_cmp:
                                    title="Overall mean per parameter"),
                             use_container_width=True)
         st.caption("Each window compresses N raw readings into one row per (country, parameter).")
+
+# ── Go vs Python benchmark tab ───────────────────────────────────────────────
+with tab_bench:
+    import glob
+    import json as _json
+    from pathlib import Path as _Path
+
+    st.subheader("Go vs Python — сравнение производительности сборщика")
+    st.caption(
+        "Результаты запуска `python -m benchmark.runner`.  "
+        "Файлы хранятся в `benchmark/results/`."
+    )
+
+    bench_dir = _Path("/app/benchmark/results")
+    result_files = sorted(bench_dir.glob("benchmark_*.json"), reverse=True)
+
+    if not result_files:
+        st.info(
+            "Результаты не найдены.  Запустите:\n"
+            "```\npython -m benchmark.runner --lang python\n```\n"
+            "или (при запущенном Go-сборщике):\n"
+            "```\npython -m benchmark.runner --lang both --go-url http://collector:8080/metrics\n```"
+        )
+    else:
+        sel_file = st.selectbox(
+            "Файл результатов",
+            result_files,
+            format_func=lambda p: p.name,
+        )
+        data = _json.loads(sel_file.read_text())
+        py_d = data.get("python", {})
+        go_d = data.get("go",     {})
+
+        # ── Summary metrics ────────────────────────────────────────────────────
+        st.markdown("#### Сводные метрики")
+        cols = st.columns(4)
+        metric_pairs = [
+            ("Ср. время / страна",  "avg_duration_ms",  "{:.1f} мс"),
+            ("Записей / сек",       "records_per_sec",  "{:.1f}"),
+            ("МБ / сек (IPC)",      "mb_per_sec",       "{:.4f}"),
+            ("Пик памяти (МиБ)",    "peak_rss_mb",      "{:.1f}"),
+        ]
+        for i, (label, key, fmt) in enumerate(metric_pairs):
+            pv = fmt.format(py_d.get(key, 0)) if py_d else "—"
+            gv = fmt.format(go_d.get(key, 0)) if go_d else "—"
+            cols[i].metric(f"🐍 {label}", pv, delta=f"Go: {gv}", delta_color="off")
+
+        # ── Bar comparison ─────────────────────────────────────────────────────
+        st.markdown("#### Сравнение ключевых показателей")
+        bar_metrics = {
+            "Ср. время / страна (мс)": "avg_duration_ms",
+            "Записей / сек":           "records_per_sec",
+            "Ср. память (МиБ)":        "avg_rss_mb",
+            "Ср. CPU %":               "avg_cpu_percent",
+        }
+        bar_rows = []
+        for label, key in bar_metrics.items():
+            if py_d:
+                bar_rows.append({"Метрика": label, "Значение": py_d.get(key, 0), "Язык": "Python"})
+            if go_d:
+                bar_rows.append({"Метрика": label, "Значение": go_d.get(key, 0), "Язык": "Go"})
+
+        df_bar = pd.DataFrame(bar_rows)
+        if not df_bar.empty:
+            fig_bar = px.bar(
+                df_bar, x="Метрика", y="Значение", color="Язык",
+                barmode="group",
+                color_discrete_map={"Python": "#3776AB", "Go": "#00ACD7"},
+                title="Go vs Python — ключевые метрики",
+            )
+            st.plotly_chart(fig_bar, use_container_width=True)
+
+        # ── Per-country breakdown ──────────────────────────────────────────────
+        st.markdown("#### Время выборки по странам (мс)")
+        country_rows = []
+        for lang, d in (("Python", py_d), ("Go", go_d)):
+            for s in d.get("samples", []):
+                country_rows.append({
+                    "Страна":    s.get("country", "?"),
+                    "Время (мс)": s.get("duration_ms", 0),
+                    "Записей":   s.get("record_count", 0),
+                    "Язык":      lang,
+                })
+        df_country = pd.DataFrame(country_rows)
+        if not df_country.empty:
+            df_avg = (
+                df_country.groupby(["Страна", "Язык"])["Время (мс)"]
+                .mean()
+                .reset_index()
+            )
+            fig_c = px.bar(
+                df_avg, x="Страна", y="Время (мс)", color="Язык",
+                barmode="group",
+                color_discrete_map={"Python": "#3776AB", "Go": "#00ACD7"},
+                title="Среднее время выборки по странам",
+            )
+            st.plotly_chart(fig_c, use_container_width=True)
+
+        # ── Memory over time ───────────────────────────────────────────────────
+        st.markdown("#### Динамика памяти по выборкам")
+        mem_rows = []
+        for lang, d in (("Python (RSS МиБ)", py_d), ("Go (heap МиБ)", go_d)):
+            for i, s in enumerate(d.get("samples", []), 1):
+                mem_rows.append({"#": i, "МиБ": s.get("rss_mb", s.get("mem_alloc_mb", 0)), "Источник": lang})
+        df_mem = pd.DataFrame(mem_rows)
+        if not df_mem.empty:
+            fig_mem = px.line(
+                df_mem, x="#", y="МиБ", color="Источник",
+                color_discrete_map={
+                    "Python (RSS МиБ)": "#3776AB",
+                    "Go (heap МиБ)":    "#00ACD7",
+                },
+                markers=True,
+                title="Память по выборкам (Python=RSS, Go=heap alloc)",
+            )
+            st.plotly_chart(fig_mem, use_container_width=True)
+
+        # ── Analysis text ──────────────────────────────────────────────────────
+        with st.expander("Методологические примечания"):
+            st.markdown("""
+**Конкурентность:**
+- Go-сборщик обходит локации **последовательно** с задержкой 150 мс между запросами.
+- Python-сборщик использует `asyncio.gather` + семафор (5 параллельных запросов).
+  При N=50 локациях это ~10× быстрее по I/O-задержке.
+
+**Память:**
+- Python: `psutil.Process().memory_info().rss` — RSS всего процесса CPython.
+- Go: `runtime.ReadMemStats().Alloc` — только выделенная heap.
+  Реальный RSS Go ~5–15 МиБ, что в разы меньше CPython.
+
+**CPU:**
+- Go: метрика CPU не измеряется на уровне отдельной выборки.
+- Python: `psutil.Process().cpu_percent()` сразу после выборки.
+""")
 
 if auto_refresh:
     time.sleep(REFRESH_SEC)

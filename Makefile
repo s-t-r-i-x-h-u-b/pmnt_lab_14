@@ -1,6 +1,7 @@
 .PHONY: build build-rust-cgo build-rust-py tidy test run-local stop \
         k8s-deploy k8s-undeploy k8s-build-images \
         k8s-hpa-setup k8s-keda-setup k8s-hpa-status k8s-load-test \
+        bench bench-python bench-compare bench-report \
         clean
 
 # ── Rust library ──────────────────────────────────────────────────────────────
@@ -96,6 +97,32 @@ k8s-load-test:
 	@echo "Load test started — fetch every 10s, flush every 50 records."
 	@echo "Run 'make k8s-hpa-status' to watch HPA scale up."
 	@echo "Restore: kubectl set env deployment/collector FETCH_INTERVAL=5m WINDOW_MAX_SIZE=500"
+
+# ── Benchmark: Go vs Python ───────────────────────────────────────────────────
+
+# Python-only benchmark (no running Go instance needed).
+bench-python:
+	pip install -q aiohttp pyarrow nats-py psutil
+	python -m benchmark.runner --lang python \
+	  --countries US,GB,DE,FR,PL,IN,AU,CA,BR,JP \
+	  --cycles 3
+
+# Compare both (Go collector must be accessible at localhost:8081).
+bench-compare:
+	pip install -q aiohttp pyarrow nats-py psutil requests
+	python -m benchmark.runner --lang both \
+	  --go-url http://localhost:8081/metrics \
+	  --countries US,GB,DE,FR,PL,IN,AU,CA,BR,JP \
+	  --cycles 3
+
+# Shortcut: python-only benchmark then generate report.
+bench: bench-python bench-report
+
+# Generate HTML report from the latest results JSON.
+bench-report:
+	pip install -q plotly
+	python -m benchmark.report
+	@echo "Open: benchmark/results/*.html"
 
 # ── Cleanup ───────────────────────────────────────────────────────────────────
 

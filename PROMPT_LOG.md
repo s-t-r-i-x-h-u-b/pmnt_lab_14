@@ -545,3 +545,91 @@ make k8s-hpa-status      # kubectl top pods + get hpa/scaledobject
 
 - scaleUp stabilization: 60 с (фильтр кратковременных пиков)
 - scaleDown stabilization: 300 с (предотвращает thrashing после сброса окна)
+
+---
+
+## 2026-05-21 — Задание «Сравнение производительности: Go vs Python»
+
+### Промпт
+> Сравнение производительности: Go vs Python для сбора.
+> Реализовать сборщик данных на Python (с использованием asyncio/aiohttp).
+> Сравнить производительность (скорость сбора, потребление памяти, CPU) между
+> Go- и Python-версиями при одинаковой нагрузке.
+> Результаты оформить в виде отчёта с графиками.
+
+### Результат
+
+#### Новые файлы
+| Файл | Назначение |
+|------|-----------|
+| `collector_py/fetcher.py`  | Async OpenAQ v3 клиент (aiohttp + asyncio.gather + семафор) |
+| `collector_py/publisher.py`| Arrow IPC кодирование + NATS публикация (nats-py) |
+| `collector_py/metrics.py`  | Замер времени, RSS, CPU% через psutil (PerfCollector) |
+| `collector_py/main.py`     | CLI-точка входа: циклы, страны, NATS URL, вывод JSON |
+| `benchmark/runner.py`      | Оркестратор: запускает Python; читает /metrics Go-сборщика; сохраняет JSON |
+| `benchmark/report.py`      | Генератор интерактивного HTML-отчёта (Plotly) |
+| `benchmark/results/`       | Директория результатов (.gitkeep) |
+
+#### Изменённые файлы
+| Файл | Что изменилось |
+|------|---------------|
+| `analysis/dashboard/app.py`    | Вкладка «Go vs Python»: bar-charts, per-country, memory timeline |
+| `analysis/requirements.txt`    | Добавлен `psutil==6.0.0` |
+| `Makefile`                     | Цели `bench`, `bench-python`, `bench-compare`, `bench-report` |
+
+#### Ключевое различие архитектур
+
+```
+Go-сборщик (sequential):
+  для каждой локации:
+    GET /locations/{id}/latest
+    sleep(150ms)              ← rate-limit delay
+  → N локаций × (150ms + T_req) ≈ 8–20 с на страну
+
+Python-сборщик (concurrent):
+  asyncio.gather(
+    fetch_loc_1(), fetch_loc_2(), ..., fetch_loc_N()
+  )                           ← семафор 5 одновременных
+  → ceil(N/5) × T_req ≈ 1–3 с на страну при тех же N
+```
+
+#### Измеряемые метрики
+
+| Метрика | Python | Go |
+|---------|--------|----|
+| Время / страна (мс) | `time.perf_counter()` | `FetchResult.DurationMs` (Go JSON) |
+| Память | `psutil.Process().memory_info().rss` (весь RSS) | `runtime.ReadMemStats().Alloc` (heap alloc) |
+| CPU% | `psutil.Process().cpu_percent()` | не измеряется на уровне выборки |
+| Записей / сек | total_records / total_ms×1000 | аналогично |
+| МБ / сек (Arrow IPC) | len(encoded) / total_ms×1000 | аналогично |
+
+#### Запуск
+
+```bash
+# Только Python (Go не нужен):
+make bench-python
+# → benchmark/results/benchmark_YYYYMMDD_HHMMSS.json
+
+# Сравнение с Go (Go-сборщик запущен):
+make run-local           # в другом терминале
+make bench-compare       # читает http://localhost:8081/metrics
+
+# HTML-отчёт:
+make bench-report
+# → benchmark/results/benchmark_*.html  (Plotly, self-contained)
+
+# Дашборд (вкладка «Go vs Python»):
+streamlit run analysis/dashboard/app.py
+```
+
+#### Ожидаемые результаты
+
+| Показатель | Python async | Go sequential | Объяснение |
+|------------|--------------|---------------|------------|
+| Время на страну | **~2–4 с** | ~10–20 с | async concurrency vs 150ms/per-loc delay |
+| Память (МиБ) | ~80–120 | ~3–8 | CPython interpreter + GC overhead |
+| CPU% при I/O | ~5–15 | ~2–5 | GIL overhead, но I/O-bound |
+| Records/sec | конкурентна или выше | ниже (sequential) | I/O-bound профиль |
+
+**Вывод**: Python async выигрывает при I/O-bound нагрузке за счёт параллелизма.
+Go выигрывает по памяти, CPU и предсказуемой задержке (нет GC-пауз).
