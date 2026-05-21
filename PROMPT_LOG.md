@@ -778,3 +778,127 @@ Kafka-топик с Hash-балансировщиком обеспечивает
 - **Объём сообщений**: каждое измерение — JSON ~200–400 байт; для 500 записей/цикл ≈ 100–200 КБ/цикл
 - **Задержка end-to-end**: poll interval 150ms (Go) + queue drain 100ms (Python) ≈ ~250ms
 - **Скользящее окно**: вычисление O(N) по активным записям в окне; на 10 стран × 5 параметров × 300 записей ≈ 15000 elem. → <1ms на compute()
+
+---
+
+## 2026-05-21 — Задание «Веб-дашборд с обновлением в реальном времени»
+
+### Промпт
+> Веб-дашборд с обновлением в реальном времени.
+> Разработать веб-дашборд на Streamlit (или FastAPI + WebSocket), который показывает
+> текущую агрегированную статистику и графики, обновляющиеся в реальном времени
+> по мере поступления новых данных от сборщика.
+
+### Результат
+
+#### Новые файлы
+| Файл | Назначение |
+|------|-----------|
+| `analysis/dashboard/realtime.html` | Автономный WebSocket-дашборд: Chart.js, тёмная тема, авто-реконнект |
+
+#### Изменённые файлы
+| Файл | Что изменилось |
+|------|---------------|
+| `analysis/api/main.py`      | WebSocket broadcasting, `_stats_broadcaster`, `/ws/live`, `/realtime`, `/ws/clients` |
+| `analysis/dashboard/app.py` | Вкладка «Live» с `@st.fragment(run_every=3)`, дельта-метрики, таймлайн, ссылка |
+| `analysis/requirements.txt` | Добавлен `kafka-python==2.0.2` |
+| `docker-compose.yml`        | `PUBLIC_API_URL` для dashboard-сервиса |
+| `k8s/analysis.yaml`         | `PUBLIC_API_URL` для dashboard-деплоя |
+
+#### Два режима обновления
+
+**1. WebSocket HTML-дашборд (`/realtime`)**
+
+Полностью автономная HTML-страница, обслуживаемая FastAPI.
+Браузер устанавливает WebSocket-соединение с `ws://host/ws/live` и получает
+события в реальном времени без каких-либо перезагрузок страницы.
+
+```
+NATS air.quality.*  →  handle_raw()   →  _ws_broadcast({type: batch_raw})
+NATS air.agg.*      →  handle_agg()   →  _ws_broadcast({type: batch_agg})
+фоновая задача      →  _stats_broadcaster() каждые 5 с  →  _ws_broadcast({type: stats})
+
+WebSocket /ws/live  ←  asyncio.Queue per client (maxsize=200)
+                    →  browser Chart.js: line/bar/doughnut/feed
+```
+
+**2. Streamlit-вкладка «Live» (авто-обновление каждые 3 с)**
+
+Использует `@st.fragment(run_every=3)` (Streamlit ≥ 1.37) — фрагмент перерисовывается
+каждые 3 секунды без перезагрузки остальных вкладок.
+
+```
+@st.fragment(run_every=3)
+def _live_fragment():
+    stats  = GET /stats          → метрики с delta
+    kstats = GET /kafka/stats    → kafka window entries
+    raw    = GET /measurements   → таймлайн, топ стран, топ параметров
+    GET /ws/clients              → число активных WebSocket-соединений
+```
+
+#### Типы WebSocket-сообщений
+
+| type | Когда | Поля |
+|------|-------|------|
+| `batch_raw`  | при каждом NATS-батче raw (≈ каждые 5 мин/сборщик) | country, parameter, count, mean_value, timestamp_ms |
+| `batch_agg`  | при каждом NATS-батче agg | country, parameter, count, mean_value |
+| `stats`      | каждые 5 с | raw_records, agg_records, country_counts{}, param_counts{}, countries[], kafka_entries, validation{} |
+| `heartbeat`  | если 25 с нет данных | — |
+
+#### HTML-дашборд (Chart.js)
+
+Визуализация:
+- **Линейный график** — скорость поступления данных (записей / 10 с), скользящее окно 60 × 10 с = 10 мин.  Буфет перекатывается каждые 10 с через `setInterval`.
+- **Горизонтальный bar chart** — топ-12 стран по числу измерений (обновляется из `stats`).
+- **Doughnut chart** — распределение по параметрам с цветовой кодировкой (pm25=красный, o3=зелёный и т.д.).
+- **Таблица событий** — последние 12 батчей с подсветкой строки при вставке.
+- **Индикатор соединения** — зелёный пульсирующий dot + счётчик msg/s.
+- **Авто-реконнект** — `setTimeout(connect, 3000)` при `ws.onclose`.
+
+#### Управление соединениями (FastAPI)
+
+```python
+_ws_clients: set[asyncio.Queue] = set()   # один Queue на соединение
+
+async def _ws_broadcast(payload):
+    for q in list(_ws_clients):
+        try: q.put_nowait(payload)
+        except QueueFull: mark_dead(q)    # slow client dropped
+
+@app.websocket("/ws/live")
+async def websocket_live(ws):
+    q = asyncio.Queue(maxsize=200)
+    _ws_clients.add(q)
+    while True:
+        payload = await asyncio.wait_for(q.get(), timeout=25)
+        await ws.send_json(payload)       # backpressure via queue
+```
+
+Изоляция через `asyncio.Queue` исключает прямую зависимость между медленными клиентами
+и обработчиками NATS-сообщений.
+
+#### Запуск
+
+```bash
+# Локально:
+make run-local
+
+# Streamlit Live-вкладка:
+http://localhost:8501  →  вкладка «Live»
+
+# Полноэкранный WebSocket-дашборд:
+http://localhost:8000/realtime
+
+# REST:
+GET http://localhost:8000/ws/clients   # {"connected_clients": 2}
+
+# Kubernetes:
+make k8s-deploy
+kubectl port-forward svc/analysis-api 8000:8000
+http://localhost:8000/realtime
+```
+
+#### Переменные среды (новые)
+| Переменная     | По умолчанию          | Описание                                   |
+|----------------|-----------------------|--------------------------------------------|
+| PUBLIC_API_URL | http://localhost:8000 | Публичный URL API (для ссылки в Streamlit) |

@@ -9,3 +9,4 @@ requests==2.32.3
 aiohttp==3.10.5
 maturin>=1.5,<2
 psutil==6.0.0
+kafka-python==2.0.2

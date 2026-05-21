@@ -77,6 +77,8 @@ spec:
           env:
             - name: API_URL
               value: "http://analysis-api:8000"
+            - name: PUBLIC_API_URL
+              value: "http://localhost:8000"
           ports:
             - containerPort: 8501
               name: http

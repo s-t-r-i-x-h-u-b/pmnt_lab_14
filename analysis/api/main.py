@@ -12,9 +12,13 @@ from collections import deque
 from contextlib import asynccontextmanager
 from typing import Any, Optional
 
+import pathlib
+import time as _time
+
 import nats
 import pyarrow as pa
-from fastapi import FastAPI, Query
+from fastapi import FastAPI, Query, WebSocket, WebSocketDisconnect
+from fastapi.responses import HTMLResponse
 
 NATS_URL        = os.getenv("NATS_URL",        "nats://localhost:4222")
 FLIGHT_ENDPOINT = os.getenv("FLIGHT_ENDPOINT", "grpc://localhost:5005")
@@ -27,6 +31,64 @@ raw_lock = asyncio.Lock()
 agg_lock = asyncio.Lock()
 
 nc_handle: nats.aio.client.Client | None = None
+
+# ── WebSocket live-push clients ───────────────────────────────────────────────
+_ws_clients: set[asyncio.Queue] = set()
+_ws_lock = asyncio.Lock()
+
+
+async def _ws_broadcast(payload: dict) -> None:
+    if not _ws_clients:
+        return
+    async with _ws_lock:
+        clients = list(_ws_clients)
+    dead: set[asyncio.Queue] = set()
+    for q in clients:
+        try:
+            q.put_nowait(payload)
+        except asyncio.QueueFull:
+            dead.add(q)
+    if dead:
+        async with _ws_lock:
+            _ws_clients.difference_update(dead)
+
+
+async def _stats_broadcaster() -> None:
+    """Push aggregated stats to all WebSocket clients every 5 s."""
+    while True:
+        await asyncio.sleep(5)
+        if not _ws_clients:
+            continue
+        country_counts: dict[str, int] = {}
+        param_counts: dict[str, int] = {}
+        async with raw_lock:
+            raw_total = len(raw_store)
+            for r in raw_store:
+                c = r.get("country_code", "")
+                p = r.get("parameter", "")
+                if c:
+                    country_counts[c] = country_counts.get(c, 0) + 1
+                if p:
+                    param_counts[p] = param_counts.get(p, 0) + 1
+        async with agg_lock:
+            agg_total = len(agg_store)
+        kafka_entries = _kc.sliding_window.entry_count() if KAFKA_BROKERS else 0
+        await _ws_broadcast({
+            "type": "stats",
+            "raw_records": raw_total,
+            "agg_records": agg_total,
+            "country_counts": dict(
+                sorted(country_counts.items(), key=lambda x: -x[1])[:15]
+            ),
+            "param_counts": dict(
+                sorted(param_counts.items(), key=lambda x: -x[1])[:10]
+            ),
+            "countries": sorted(country_counts)[:20],
+            "kafka_entries": kafka_entries,
+            "validation": dict(_validation_stats),
+            "timestamp_ms": int(_time.time() * 1000),
+        })
+
 
 # ── Kafka consumer + sliding window (optional) ───────────────────────────────
 from kafka_consumer import consumer as _kc
@@ -95,14 +157,37 @@ async def handle_raw(msg: nats.aio.msg.Msg) -> None:
         if _HAS_VALIDATOR:
             _validation_stats["validated"] += len(rows)
             _validation_stats["invalid"]   += len(rows) - len(valid_rows)
+        if valid_rows and _ws_clients:
+            from collections import Counter as _Ctr
+            pc = _Ctr(r.get("parameter", "") for r in valid_rows)
+            top_param = pc.most_common(1)[0][0] if pc else ""
+            vals = [float(r["value"]) for r in valid_rows if r.get("value") is not None]
+            asyncio.ensure_future(_ws_broadcast({
+                "type": "batch_raw",
+                "country": valid_rows[0].get("country_code", ""),
+                "parameter": top_param,
+                "count": len(valid_rows),
+                "mean_value": round(sum(vals) / len(vals), 3) if vals else 0,
+                "timestamp_ms": int(_time.time() * 1000),
+            }))
     except Exception as exc:
         print(f"[raw] decode error: {exc}")
 
 
 async def handle_agg(msg: nats.aio.msg.Msg) -> None:
     try:
+        rows = _decode_arrow(msg.data)
         async with agg_lock:
-            agg_store.extend(_decode_arrow(msg.data))
+            agg_store.extend(rows)
+        if rows and _ws_clients:
+            r = rows[0]
+            asyncio.ensure_future(_ws_broadcast({
+                "type": "batch_agg",
+                "country": str(r.get("country_code", "")),
+                "parameter": str(r.get("parameter", "")),
+                "count": int(r.get("count", 0) or 0),
+                "mean_value": round(float(r.get("mean_value", 0) or 0), 3),
+            }))
     except Exception as exc:
         print(f"[agg] decode error: {exc}")
 
@@ -113,6 +198,7 @@ async def lifespan(app: FastAPI):  # noqa: ANN001
     nc_handle = await nats.connect(NATS_URL)
     await nc_handle.subscribe("air.quality.*", cb=handle_raw)
     await nc_handle.subscribe("air.agg.*",     cb=handle_agg)
+    asyncio.ensure_future(_stats_broadcaster())
     print(f"[startup] NATS connected: {NATS_URL}")
     print(f"[startup] Flight endpoint: {FLIGHT_ENDPOINT}")
     print(f"[startup] Rust validator: {'enabled' if _HAS_VALIDATOR else 'disabled (wheel not installed)'}")
@@ -384,3 +470,42 @@ async def flight_benchmark(
         "throughput_rows_s": round(avg_rows  / (avg_lat / 1000), 1) if avg_lat else 0,
         "throughput_mb_s":   round(avg_bytes / (avg_lat / 1000) / 1e6, 3) if avg_lat else 0,
     }
+
+
+# ── Real-time WebSocket endpoint ──────────────────────────────────────────────
+
+@app.websocket("/ws/live")
+async def websocket_live(ws: WebSocket) -> None:
+    """Push stream: batch_raw / batch_agg events + periodic stats snapshots."""
+    await ws.accept()
+    q: asyncio.Queue = asyncio.Queue(maxsize=200)
+    async with _ws_lock:
+        _ws_clients.add(q)
+    try:
+        while True:
+            try:
+                payload = await asyncio.wait_for(q.get(), timeout=25.0)
+                await ws.send_json(payload)
+            except asyncio.TimeoutError:
+                await ws.send_json({"type": "heartbeat"})
+    except (WebSocketDisconnect, Exception):
+        pass
+    finally:
+        async with _ws_lock:
+            _ws_clients.discard(q)
+
+
+@app.get("/realtime", response_class=HTMLResponse)
+async def realtime_dashboard() -> HTMLResponse:
+    """Serve the standalone real-time Chart.js/WebSocket dashboard."""
+    html_path = pathlib.Path(__file__).parent.parent / "dashboard" / "realtime.html"
+    if html_path.exists():
+        return HTMLResponse(content=html_path.read_text(encoding="utf-8"))
+    return HTMLResponse(content="<h1>realtime.html not found</h1>", status_code=404)
+
+
+@app.get("/ws/clients")
+async def ws_client_count() -> dict[str, Any]:
+    """Number of active WebSocket connections."""
+    async with _ws_lock:
+        return {"connected_clients": len(_ws_clients)}

@@ -1,0 +1,476 @@
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Air Quality — Live Monitor</title>
+  <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.0/dist/chart.umd.min.js"></script>
+  <style>
+    :root {
+      --bg:       #0f172a;
+      --surface:  #1e293b;
+      --border:   #334155;
+      --text:     #e2e8f0;
+      --muted:    #64748b;
+      --blue:     #3b82f6;
+      --green:    #22c55e;
+      --red:      #ef4444;
+      --yellow:   #f59e0b;
+      --purple:   #a855f7;
+    }
+
+    * { box-sizing: border-box; margin: 0; padding: 0; }
+
+    body {
+      font-family: ui-sans-serif, system-ui, -apple-system, sans-serif;
+      background: var(--bg);
+      color: var(--text);
+      min-height: 100vh;
+    }
+
+    /* ── Header ── */
+    header {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      height: 52px;
+      padding: 0 24px;
+      background: var(--surface);
+      border-bottom: 1px solid var(--border);
+      position: sticky;
+      top: 0;
+      z-index: 10;
+    }
+    .logo { font-size: 15px; font-weight: 700; letter-spacing: -0.2px; }
+    .logo em { color: var(--blue); font-style: normal; }
+
+    .hdr-right { display: flex; align-items: center; gap: 16px; font-size: 13px; }
+
+    .conn-pill {
+      display: flex; align-items: center; gap: 7px;
+      padding: 4px 12px;
+      background: rgba(255,255,255,0.04);
+      border: 1px solid var(--border);
+      border-radius: 99px;
+      color: var(--muted);
+    }
+    .dot {
+      width: 8px; height: 8px;
+      border-radius: 50%;
+      background: var(--red);
+      transition: background .3s;
+      flex-shrink: 0;
+    }
+    .dot.on {
+      background: var(--green);
+      box-shadow: 0 0 0 3px rgba(34,197,94,.18);
+      animation: pulse-dot 2s infinite;
+    }
+    @keyframes pulse-dot {
+      0%,100% { box-shadow: 0 0 0 3px rgba(34,197,94,.18); }
+      50%      { box-shadow: 0 0 0 6px rgba(34,197,94,.04); }
+    }
+
+    .rate-badge {
+      font-size: 12px;
+      color: var(--muted);
+      background: rgba(255,255,255,0.04);
+      border: 1px solid var(--border);
+      padding: 4px 12px;
+      border-radius: 99px;
+      font-variant-numeric: tabular-nums;
+      min-width: 72px;
+      text-align: center;
+    }
+
+    /* ── Layout ── */
+    .page { padding: 18px 24px; max-width: 1600px; margin: 0 auto; display: flex; flex-direction: column; gap: 14px; }
+
+    /* ── Stat cards ── */
+    .stats { display: grid; grid-template-columns: repeat(4, 1fr); gap: 12px; }
+    .stat {
+      background: var(--surface);
+      border: 1px solid var(--border);
+      border-radius: 10px;
+      padding: 16px 20px;
+    }
+    .stat-label {
+      font-size: 11px;
+      text-transform: uppercase;
+      letter-spacing: .6px;
+      color: var(--muted);
+      margin-bottom: 8px;
+    }
+    .stat-value {
+      font-size: 30px;
+      font-weight: 700;
+      line-height: 1;
+      font-variant-numeric: tabular-nums;
+    }
+    .stat-delta { font-size: 12px; color: var(--green); margin-top: 5px; min-height: 15px; }
+
+    /* ── Cards ── */
+    .card {
+      background: var(--surface);
+      border: 1px solid var(--border);
+      border-radius: 10px;
+      padding: 16px 20px;
+    }
+    .card-title {
+      font-size: 12px;
+      font-weight: 500;
+      text-transform: uppercase;
+      letter-spacing: .5px;
+      color: var(--muted);
+      margin-bottom: 14px;
+    }
+
+    /* ── Chart grids ── */
+    .row-2 { display: grid; grid-template-columns: 3fr 2fr; gap: 14px; }
+
+    /* ── Feed table ── */
+    .feed { overflow: hidden; }
+    table { width: 100%; border-collapse: collapse; font-size: 13px; }
+    th {
+      font-size: 11px;
+      font-weight: 500;
+      text-transform: uppercase;
+      letter-spacing: .5px;
+      color: var(--muted);
+      padding: 6px 16px;
+      text-align: left;
+      border-bottom: 1px solid var(--border);
+    }
+    td { padding: 9px 16px; border-bottom: 1px solid rgba(51,65,85,.4); }
+    tbody tr:last-child td { border-bottom: none; }
+    .flash { animation: row-flash .7s ease-out; }
+    @keyframes row-flash {
+      0%   { background: rgba(59,130,246,.18); }
+      100% { background: transparent; }
+    }
+    .badge {
+      display: inline-block;
+      font-size: 11px; font-weight: 600;
+      padding: 2px 9px;
+      border-radius: 99px;
+    }
+    .country-tag {
+      font-size: 12px;
+      font-weight: 700;
+      letter-spacing: .4px;
+    }
+
+    @media (max-width: 900px) {
+      .stats   { grid-template-columns: repeat(2, 1fr); }
+      .row-2   { grid-template-columns: 1fr; }
+    }
+  </style>
+</head>
+<body>
+
+<header>
+  <div class="logo">Air Quality <em>Live</em></div>
+  <div class="hdr-right">
+    <div class="conn-pill">
+      <div class="dot" id="dot"></div>
+      <span id="conn-text">Подключение…</span>
+    </div>
+    <div class="rate-badge" id="msg-rate">— msg/s</div>
+  </div>
+</header>
+
+<div class="page">
+
+  <!-- Stats row -->
+  <div class="stats">
+    <div class="stat">
+      <div class="stat-label">Сырых записей</div>
+      <div class="stat-value" id="s-raw">—</div>
+      <div class="stat-delta" id="s-raw-d"></div>
+    </div>
+    <div class="stat">
+      <div class="stat-label">Активных стран</div>
+      <div class="stat-value" id="s-cc">—</div>
+      <div class="stat-delta"></div>
+    </div>
+    <div class="stat">
+      <div class="stat-label">Параметров</div>
+      <div class="stat-value" id="s-pm">—</div>
+      <div class="stat-delta"></div>
+    </div>
+    <div class="stat">
+      <div class="stat-label">Kafka-окно (записей)</div>
+      <div class="stat-value" id="s-kf">—</div>
+      <div class="stat-delta"></div>
+    </div>
+  </div>
+
+  <!-- Rate line chart -->
+  <div class="card">
+    <div class="card-title">Скорость поступления данных (записей / 10 с)</div>
+    <div style="position:relative;height:190px">
+      <canvas id="c-line"></canvas>
+    </div>
+  </div>
+
+  <!-- Country bar + Param doughnut -->
+  <div class="row-2">
+    <div class="card">
+      <div class="card-title">Топ стран по числу измерений</div>
+      <div style="position:relative;height:270px">
+        <canvas id="c-country"></canvas>
+      </div>
+    </div>
+    <div class="card">
+      <div class="card-title">Распределение по параметрам</div>
+      <div style="position:relative;height:270px">
+        <canvas id="c-param"></canvas>
+      </div>
+    </div>
+  </div>
+
+  <!-- Live event feed -->
+  <div class="card feed">
+    <div class="card-title">Последние события</div>
+    <table>
+      <thead>
+        <tr>
+          <th>Страна</th>
+          <th>Параметр</th>
+          <th>Записей в батче</th>
+          <th>Среднее значение</th>
+          <th>Время</th>
+        </tr>
+      </thead>
+      <tbody id="feed">
+        <tr><td colspan="5" style="color:var(--muted);text-align:center;padding:24px">
+          Ожидание первых данных…
+        </td></tr>
+      </tbody>
+    </table>
+  </div>
+
+</div><!-- /page -->
+
+<script>
+// ── Colour palette ────────────────────────────────────────────────────────────
+const PALETTE = [
+  '#3b82f6','#22c55e','#f59e0b','#ef4444','#a855f7',
+  '#06b6d4','#f97316','#84cc16','#ec4899','#14b8a6',
+  '#8b5cf6','#0ea5e9','#d946ef','#10b981','#f43f5e',
+];
+
+const PARAM_CLR = {
+  pm25:'#ef4444', pm10:'#f97316', o3:'#22c55e',
+  no2:'#f59e0b',  so2:'#a855f7', co:'#06b6d4',
+  humidity:'#3b82f6', temperature:'#ec4899', pressure:'#10b981',
+  bc:'#84cc16',
+};
+
+// ── Chart.js global defaults ──────────────────────────────────────────────────
+Chart.defaults.color        = '#64748b';
+Chart.defaults.borderColor  = 'rgba(51,65,85,.5)';
+Chart.defaults.font.family  = 'ui-sans-serif, system-ui, sans-serif';
+
+// ── Rolling rate line chart (60 × 10 s = 10 min) ─────────────────────────────
+const N_BUCKETS  = 60;
+const BUCKET_MS  = 10_000;
+let   curBucket  = 0;
+
+function makeLabels() {
+  const now = Date.now();
+  return Array.from({ length: N_BUCKETS }, (_, i) =>
+    new Date(now - (N_BUCKETS - 1 - i) * BUCKET_MS)
+      .toLocaleTimeString('ru', { hour:'2-digit', minute:'2-digit', second:'2-digit' })
+  );
+}
+
+const lineData = new Array(N_BUCKETS).fill(0);
+
+const lineChart = new Chart(document.getElementById('c-line'), {
+  type: 'line',
+  data: {
+    labels: makeLabels(),
+    datasets: [{
+      data: [...lineData],
+      borderColor:     '#3b82f6',
+      backgroundColor: 'rgba(59,130,246,.07)',
+      fill: true,
+      tension: 0.35,
+      pointRadius: 0,
+      borderWidth: 2,
+    }],
+  },
+  options: {
+    responsive: true, maintainAspectRatio: false,
+    animation: false,
+    plugins: {
+      legend: { display: false },
+      tooltip: { mode: 'index', intersect: false },
+    },
+    scales: {
+      x: { ticks: { maxTicksLimit: 8, maxRotation: 0 },
+           grid:  { color: 'rgba(51,65,85,.4)' } },
+      y: { beginAtZero: true,
+           grid: { color: 'rgba(51,65,85,.4)' } },
+    },
+  },
+});
+
+// Roll bucket every 10 s
+setInterval(() => {
+  lineData.shift();
+  lineData.push(curBucket);
+  curBucket = 0;
+  lineChart.data.labels           = makeLabels();
+  lineChart.data.datasets[0].data = [...lineData];
+  lineChart.update('none');
+}, BUCKET_MS);
+
+// ── Country horizontal bar chart ──────────────────────────────────────────────
+const countryChart = new Chart(document.getElementById('c-country'), {
+  type: 'bar',
+  data: { labels: [], datasets: [{ data: [], backgroundColor: PALETTE, borderRadius: 3 }] },
+  options: {
+    indexAxis: 'y',
+    responsive: true, maintainAspectRatio: false,
+    animation: { duration: 250 },
+    plugins: { legend: { display: false } },
+    scales: {
+      x: { grid: { color: 'rgba(51,65,85,.4)' } },
+      y: { ticks: { font: { size: 11 } }, grid: { display: false } },
+    },
+  },
+});
+
+// ── Parameter doughnut chart ──────────────────────────────────────────────────
+const paramChart = new Chart(document.getElementById('c-param'), {
+  type: 'doughnut',
+  data: { labels: [], datasets: [{ data: [], backgroundColor: PALETTE, borderWidth: 0, hoverOffset: 6 }] },
+  options: {
+    responsive: true, maintainAspectRatio: false,
+    animation: { duration: 250 },
+    cutout: '60%',
+    plugins: {
+      legend: {
+        position: 'right',
+        labels: { font: { size: 11 }, padding: 12, boxWidth: 11 },
+      },
+    },
+  },
+});
+
+// ── Live feed ─────────────────────────────────────────────────────────────────
+const MAX_FEED = 12;
+const feed = [];
+
+function paramBadge(p) {
+  const c = PARAM_CLR[p] ?? '#64748b';
+  return `<span class="badge" style="background:${c}22;color:${c}">${p}</span>`;
+}
+
+function renderFeed() {
+  const tbody = document.getElementById('feed');
+  if (!feed.length) return;
+  tbody.innerHTML = feed.map((r, i) => `
+    <tr class="${i === 0 ? 'flash' : ''}">
+      <td><span class="country-tag">${r.country || '—'}</span></td>
+      <td>${paramBadge(r.param || '—')}</td>
+      <td>${(r.count || 0).toLocaleString('ru')}</td>
+      <td>${r.mean != null ? r.mean.toFixed(3) : '—'}</td>
+      <td style="color:var(--muted)">${r.time}</td>
+    </tr>
+  `).join('');
+}
+
+function pushFeed(country, param, count, mean) {
+  feed.unshift({ country, param, count, mean, time: new Date().toLocaleTimeString('ru') });
+  if (feed.length > MAX_FEED) feed.length = MAX_FEED;
+  renderFeed();
+}
+
+// ── Stats panel update ────────────────────────────────────────────────────────
+let prevRaw = 0;
+
+function applyStats(d) {
+  const raw = d.raw_records ?? 0;
+  document.getElementById('s-raw').textContent = raw.toLocaleString('ru');
+  const delta = raw - prevRaw;
+  document.getElementById('s-raw-d').textContent =
+    (prevRaw > 0 && delta > 0) ? `+${delta} за 5 с` : '';
+  prevRaw = raw;
+
+  const cc = d.country_counts ?? {};
+  const pc = d.param_counts   ?? {};
+  document.getElementById('s-cc').textContent = Object.keys(cc).length;
+  document.getElementById('s-pm').textContent = Object.keys(pc).length;
+  document.getElementById('s-kf').textContent = (d.kafka_entries ?? 0).toLocaleString('ru');
+
+  // Country chart
+  const ccArr = Object.entries(cc).sort((a,b) => b[1]-a[1]).slice(0, 12);
+  countryChart.data.labels                     = ccArr.map(e => e[0]);
+  countryChart.data.datasets[0].data           = ccArr.map(e => e[1]);
+  countryChart.data.datasets[0].backgroundColor = PALETTE.slice(0, ccArr.length);
+  countryChart.update('none');
+
+  // Param doughnut
+  const pcArr = Object.entries(pc).sort((a,b) => b[1]-a[1]);
+  paramChart.data.labels                     = pcArr.map(e => e[0]);
+  paramChart.data.datasets[0].data           = pcArr.map(e => e[1]);
+  paramChart.data.datasets[0].backgroundColor = pcArr.map(e => PARAM_CLR[e[0]] ?? '#64748b');
+  paramChart.update('none');
+}
+
+// ── Message rate counter ──────────────────────────────────────────────────────
+let totalMsgs = 0, snapMsgs = 0;
+setInterval(() => {
+  document.getElementById('msg-rate').textContent = `${totalMsgs - snapMsgs} msg/s`;
+  snapMsgs = totalMsgs;
+}, 1000);
+
+// ── WebSocket connection with auto-reconnect ──────────────────────────────────
+const dot      = document.getElementById('dot');
+const connText = document.getElementById('conn-text');
+
+function connect() {
+  const proto = location.protocol === 'https:' ? 'wss:' : 'ws:';
+  const ws    = new WebSocket(`${proto}//${location.host}/ws/live`);
+
+  ws.onopen = () => {
+    dot.className      = 'dot on';
+    connText.textContent = 'Подключено';
+  };
+
+  ws.onmessage = evt => {
+    totalMsgs++;
+    let msg;
+    try { msg = JSON.parse(evt.data); } catch { return; }
+
+    switch (msg.type) {
+      case 'stats':
+        applyStats(msg);
+        break;
+      case 'batch_raw':
+        curBucket += msg.count ?? 1;
+        pushFeed(msg.country, msg.parameter, msg.count ?? 1, msg.mean_value);
+        break;
+      case 'batch_agg':
+        pushFeed(msg.country, (msg.parameter ?? '') + ' ★', msg.count ?? 0, msg.mean_value);
+        break;
+      // 'heartbeat' — silently ignored
+    }
+  };
+
+  ws.onclose = () => {
+    dot.className      = 'dot';
+    connText.textContent = 'Переподключение…';
+    setTimeout(connect, 3_000);
+  };
+
+  ws.onerror = () => ws.close();
+}
+
+connect();
+</script>
+</body>
+</html>

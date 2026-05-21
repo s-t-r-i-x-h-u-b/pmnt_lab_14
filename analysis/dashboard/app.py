@@ -8,8 +8,9 @@ import plotly.graph_objects as go
 import requests
 import streamlit as st
 
-API_URL     = os.getenv("API_URL",     "http://localhost:8000")
-REFRESH_SEC = 30
+API_URL        = os.getenv("API_URL",        "http://localhost:8000")
+PUBLIC_API_URL = os.getenv("PUBLIC_API_URL", "http://localhost:8000")
+REFRESH_SEC    = 30
 
 st.set_page_config(page_title="Air Quality Monitor", layout="wide")
 st.title("Air Quality Monitor — OpenAQ")
@@ -52,9 +53,9 @@ c3.metric("Countries",  len(stats.get("countries",  [])))
 c4.metric("Parameters", len(stats.get("parameters", [])))
 
 # ── Tabs ──────────────────────────────────────────────────────────────────────
-tab_raw, tab_agg, tab_flight, tab_cmp, tab_kafka, tab_bench = st.tabs([
+tab_raw, tab_agg, tab_flight, tab_cmp, tab_kafka, tab_bench, tab_live = st.tabs([
     "Raw measurements", "Aggregated windows", "Arrow Flight (direct)", "Compression",
-    "Kafka sliding window", "Go vs Python",
+    "Kafka sliding window", "Go vs Python", "Live",
 ])
 
 # ── Raw tab ───────────────────────────────────────────────────────────────────
@@ -427,6 +428,131 @@ with tab_bench:
 - Go: метрика CPU не измеряется на уровне отдельной выборки.
 - Python: `psutil.Process().cpu_percent()` сразу после выборки.
 """)
+
+# ── Live real-time tab ────────────────────────────────────────────────────────
+with tab_live:
+    st.subheader("Мониторинг в реальном времени")
+    st.caption(
+        "Данные обновляются каждые 3 секунды.  "
+        "Для по-настоящему потокового отображения без перезагрузки страницы "
+        "используйте полноэкранный WebSocket-дашборд."
+    )
+
+    col_btn, col_ws = st.columns([1, 3])
+    with col_btn:
+        st.link_button(
+            "Открыть Live WebSocket-дашборд",
+            f"{PUBLIC_API_URL}/realtime",
+            use_container_width=True,
+        )
+    with col_ws:
+        st.code(f"WebSocket: ws://localhost:8000/ws/live  |  REST: {PUBLIC_API_URL}/ws/clients")
+
+    st.divider()
+
+    @st.fragment(run_every=3)
+    def _live_fragment() -> None:
+        live_stats  = fetch_obj("/stats")
+        live_kstats = fetch_obj("/kafka/stats")
+
+        # ── Metrics with delta ────────────────────────────────────────────────
+        raw_now  = live_stats.get("raw_records", 0)
+        agg_now  = live_stats.get("agg_records", 0)
+        kwin_now = live_kstats.get("window_entries", 0) if live_kstats.get("enabled") else 0
+
+        prev_raw  = st.session_state.get("_live_raw",  raw_now)
+        prev_agg  = st.session_state.get("_live_agg",  agg_now)
+        prev_kwin = st.session_state.get("_live_kwin", kwin_now)
+
+        st.session_state["_live_raw"]  = raw_now
+        st.session_state["_live_agg"]  = agg_now
+        st.session_state["_live_kwin"] = kwin_now
+
+        m1, m2, m3, m4 = st.columns(4)
+        m1.metric("Raw records (NATS)",     raw_now,
+                  delta=raw_now - prev_raw   if raw_now  != prev_raw  else None)
+        m2.metric("Agg records (NATS)",     agg_now,
+                  delta=agg_now - prev_agg   if agg_now  != prev_agg  else None)
+        m3.metric("Kafka window entries",   kwin_now,
+                  delta=kwin_now - prev_kwin if kwin_now != prev_kwin else None)
+        m4.metric("WS clients",
+                  fetch_obj("/ws/clients").get("connected_clients", 0))
+
+        # ── Timeline: records per minute over last 30 min ────────────────────
+        live_raw = fetch("/measurements", limit=5000)
+        df_live  = pd.DataFrame(live_raw)
+        if not df_live.empty and "timestamp" in df_live.columns:
+            df_live["ts"] = pd.to_datetime(df_live["timestamp"], utc=True, errors="coerce")
+            df_live = df_live.dropna(subset=["ts"])
+            df_live["bucket"] = df_live["ts"].dt.floor("1min")
+            now_utc = pd.Timestamp.now(tz="UTC")
+            df_tl = (
+                df_live[df_live["bucket"] >= now_utc - pd.Timedelta(minutes=30)]
+                .groupby("bucket")
+                .size()
+                .reset_index(name="count")
+            )
+            if not df_tl.empty:
+                fig_tl = go.Figure(go.Scatter(
+                    x=df_tl["bucket"], y=df_tl["count"],
+                    mode="lines", fill="tozeroy",
+                    line=dict(color="#3b82f6", width=2),
+                ))
+                fig_tl.update_layout(
+                    title="Измерений в минуту (последние 30 мин)",
+                    height=200,
+                    margin=dict(l=0, r=0, t=30, b=0),
+                    showlegend=False,
+                    xaxis=dict(showgrid=True),
+                    yaxis=dict(showgrid=True),
+                )
+                st.plotly_chart(fig_tl, use_container_width=True)
+
+        # ── Top countries + top parameters (side by side) ────────────────────
+        countries_live = live_stats.get("countries", [])
+        params_live    = live_stats.get("parameters", [])
+
+        if not df_live.empty:
+            ca, cb = st.columns(2)
+
+            with ca:
+                cc_counts = df_live["country_code"].value_counts().head(12).reset_index()
+                cc_counts.columns = ["country_code", "count"]
+                fig_cc = px.bar(
+                    cc_counts, x="count", y="country_code", orientation="h",
+                    title=f"Топ стран ({len(countries_live)} активных)",
+                    labels={"count": "Измерений", "country_code": ""},
+                )
+                fig_cc.update_layout(height=300, margin=dict(l=0, r=0, t=30, b=0), showlegend=False)
+                fig_cc.update_traces(marker_color="#3b82f6")
+                st.plotly_chart(fig_cc, use_container_width=True)
+
+            with cb:
+                pm_counts = df_live["parameter"].value_counts().reset_index()
+                pm_counts.columns = ["parameter", "count"]
+                fig_pm = px.pie(
+                    pm_counts, names="parameter", values="count",
+                    title=f"Параметры ({len(params_live)} активных)",
+                    hole=0.55,
+                )
+                fig_pm.update_layout(height=300, margin=dict(l=0, r=0, t=30, b=0))
+                st.plotly_chart(fig_pm, use_container_width=True)
+
+        # ── Last 20 raw measurements ──────────────────────────────────────────
+        if not df_live.empty:
+            show_cols = [c for c in
+                         ["timestamp", "country_code", "parameter", "value", "unit", "location_name"]
+                         if c in df_live.columns]
+            st.dataframe(
+                df_live[show_cols].tail(20).sort_values("timestamp", ascending=False),
+                use_container_width=True,
+                hide_index=True,
+            )
+
+        st.caption(f"Последнее обновление: {time.strftime('%H:%M:%S')}")
+
+    _live_fragment()
+
 
 if auto_refresh:
     time.sleep(REFRESH_SEC)
