@@ -21,12 +21,10 @@ import argparse
 import asyncio
 import json
 import os
-import sys
 import time
 from datetime import datetime, timezone
 from pathlib import Path
 
-import aiohttp
 import requests
 
 RESULTS_DIR = Path(__file__).parent / "results"

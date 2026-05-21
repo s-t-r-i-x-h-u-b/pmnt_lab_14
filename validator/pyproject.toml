@@ -11,4 +11,3 @@ requires-python = ">=3.9"
 [tool.maturin]
 features       = ["python"]
 module-name    = "air_quality_validator"
-python-source  = "python"

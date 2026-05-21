@@ -246,10 +246,14 @@ func (c *Coordinator) startShard(ctx context.Context, shard string) {
 
 func (c *Coordinator) stopShard(shard string) {
 	c.mu.Lock()
-	defer c.mu.Unlock()
-	if cancel, ok := c.assignedShards[shard]; ok {
-		cancel()
+	cancel, ok := c.assignedShards[shard]
+	if ok {
 		delete(c.assignedShards, shard)
+	}
+	c.mu.Unlock()
+
+	if ok {
+		cancel()
 		c.logger.Info("Shard unassigned", zap.String("shard", shard))
 	}
 	if c.onUnassigned != nil {

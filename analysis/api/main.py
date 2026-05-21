@@ -16,6 +16,7 @@ import pathlib
 import time as _time
 
 import nats
+import pandas as _pd
 import pyarrow as pa
 from fastapi import FastAPI, Query, WebSocket, WebSocketDisconnect
 from fastapi.responses import HTMLResponse
@@ -115,7 +116,6 @@ def _is_valid_row(row: dict[str, Any]) -> bool:
         return True
     ts = row.get("timestamp")
     try:
-        import pandas as _pd
         if isinstance(ts, _pd.Timestamp):
             ts_us = ts.value // 1000  # nanoseconds → microseconds
         else:

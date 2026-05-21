@@ -36,12 +36,21 @@ def _load_latest() -> dict:
 
 
 def _per_country(data: dict, key: str) -> tuple[list[str], list[float]]:
-    countries, vals = [], []
+    # Aggregate by country (mean) so multi-cycle Python samples collapse to one bar per country.
+    sums: dict[str, float] = {}
+    counts: dict[str, int] = {}
+    order: list[str] = []
     for s in data.get("samples", []):
-        if s.get("country") not in countries:
-            countries.append(s["country"])
-            vals.append(float(s.get(key, 0)))
-    return countries, vals
+        c = s.get("country")
+        if not c:
+            continue
+        if c not in sums:
+            order.append(c)
+            sums[c] = 0.0
+            counts[c] = 0
+        sums[c] += float(s.get(key, 0) or 0)
+        counts[c] += 1
+    return order, [sums[c] / counts[c] for c in order]
 
 
 # ── Chart builders ────────────────────────────────────────────────────────────
@@ -126,25 +135,26 @@ def _duration_box(fig: go.Figure, row: int, col: int, results: dict) -> None:
 # ── Summary table HTML ────────────────────────────────────────────────────────
 
 def _summary_table(results: dict) -> str:
-    py = results.get("python", {})
-    go = results.get("go", {})
+    # NOTE: use go_d / py_d locally — `go` is the imported plotly.graph_objects module.
+    py_d = results.get("python", {})
+    go_d = results.get("go", {})
     rows = [
-        ("Всего записей",          py.get("total_records",   "-"), go.get("total_records",   "-")),
-        ("Всего выборок",          py.get("fetch_count",      "-"), go.get("fetch_count",      "-")),
-        ("Общее время (мс)",       f"{py.get('total_ms',0):.0f}"    if py else "-",
-                                   f"{go.get('total_ms',0):.0f}"    if go else "-"),
-        ("Ср. время / страна (мс)",f"{py.get('avg_duration_ms',0):.1f}" if py else "-",
-                                   f"{go.get('avg_duration_ms',0):.1f}" if go else "-"),
-        ("Записей / сек",          f"{py.get('records_per_sec',0):.1f}" if py else "-",
-                                   f"{go.get('records_per_sec',0):.1f}" if go else "-"),
-        ("МБ / сек (IPC-кодирование)", f"{py.get('mb_per_sec',0):.4f}" if py else "-",
-                                       f"{go.get('mb_per_sec',0):.4f}" if go else "-"),
-        ("Ср. память (МиБ)",       f"{py.get('avg_rss_mb',0):.1f} (RSS)"   if py else "-",
-                                   f"{go.get('avg_rss_mb',0):.1f} (heap)"  if go else "-"),
-        ("Пик памяти (МиБ)",       f"{py.get('peak_rss_mb',0):.1f}"        if py else "-",
-                                   f"{go.get('peak_rss_mb',0):.1f}"        if go else "-"),
-        ("Ср. CPU %",              f"{py.get('avg_cpu_percent',0):.1f}"     if py else "-",
-                                   "—  (не измеряется на уровне выборки)"  if go else "-"),
+        ("Всего записей",          py_d.get("total_records",   "-"), go_d.get("total_records",   "-")),
+        ("Всего выборок",          py_d.get("fetch_count",      "-"), go_d.get("fetch_count",      "-")),
+        ("Общее время (мс)",       f"{py_d.get('total_ms',0):.0f}"    if py_d else "-",
+                                   f"{go_d.get('total_ms',0):.0f}"    if go_d else "-"),
+        ("Ср. время / страна (мс)",f"{py_d.get('avg_duration_ms',0):.1f}" if py_d else "-",
+                                   f"{go_d.get('avg_duration_ms',0):.1f}" if go_d else "-"),
+        ("Записей / сек",          f"{py_d.get('records_per_sec',0):.1f}" if py_d else "-",
+                                   f"{go_d.get('records_per_sec',0):.1f}" if go_d else "-"),
+        ("МБ / сек (IPC-кодирование)", f"{py_d.get('mb_per_sec',0):.4f}" if py_d else "-",
+                                       f"{go_d.get('mb_per_sec',0):.4f}" if go_d else "-"),
+        ("Ср. память (МиБ)",       f"{py_d.get('avg_rss_mb',0):.1f} (RSS)"   if py_d else "-",
+                                   f"{go_d.get('avg_rss_mb',0):.1f} (heap)"  if go_d else "-"),
+        ("Пик памяти (МиБ)",       f"{py_d.get('peak_rss_mb',0):.1f}"        if py_d else "-",
+                                   f"{go_d.get('peak_rss_mb',0):.1f}"        if go_d else "-"),
+        ("Ср. CPU %",              f"{py_d.get('avg_cpu_percent',0):.1f}"     if py_d else "-",
+                                   "—  (не измеряется на уровне выборки)"  if go_d else "-"),
     ]
     header = """
 <table style="border-collapse:collapse;font-family:sans-serif;font-size:14px;margin:20px auto">
@@ -165,7 +175,7 @@ def _summary_table(results: dict) -> str:
             f'<td style="padding:6px 16px;text-align:right;color:#00ACD7"><b>{gv}</b></td>'
             f"</tr>"
         )
-    note_mem = go.get("note_mem", "")
+    note_mem = go_d.get("note_mem", "")
     footer = (
         f'<tr><td colspan="3" style="padding:6px 16px;font-size:12px;color:#666">'
         f"⚠ {note_mem}</td></tr>"

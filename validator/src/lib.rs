@@ -181,7 +181,7 @@ mod python_ext {
     }
 
     /// Convenience: validate every row of a dict-of-lists (column-oriented).
-    /// Returns a list of ValidationResult in the same order.
+    /// Returns a tuple (valid_flags, error_counts) for easy pandas integration.
     #[pyfunction]
     fn validate_columns(
         py:            Python<'_>,
@@ -195,19 +195,9 @@ mod python_ext {
         let results = validate_batch_py(
             country_codes, parameters, values, latitudes, longitudes, timestamps_us,
         );
-        let valid_flags: Vec<bool>  = results.iter().map(|r| r.valid).collect();
-        let error_lists: Vec<Vec<PyObject>> = results.iter().map(|r| {
-            r.errors.iter().map(|e| {
-                pyo3::types::PyDict::new_bound(py)
-                    .into()
-            }).collect()
-        }).collect();
-
-        // Return (valid_flags, error_counts) as a tuple for easy pandas integration.
-        let valid_counts: Vec<usize> = results.iter().map(|r| if r.valid { 1 } else { 0 }).collect();
-        let err_counts:   Vec<usize> = results.iter().map(|r| r.errors.len()).collect();
-        let _ = (valid_flags, error_lists);
-        Ok((valid_counts, err_counts).into_py(py))
+        let valid_flags: Vec<bool>   = results.iter().map(|r| r.valid).collect();
+        let err_counts:  Vec<usize>  = results.iter().map(|r| r.errors.len()).collect();
+        Ok((valid_flags, err_counts).into_py(py))
     }
 
     #[pymodule]
